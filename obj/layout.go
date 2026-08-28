@@ -368,6 +368,7 @@ func (w *Writer) place(l *layout) error {
 		if len(s.relocs) == 0 {
 			continue
 		}
+		s.relocBase = off - l.relocOff
 		off += uint64(len(s.relocs)) * format.RelocSize
 	}
 

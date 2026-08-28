@@ -1,6 +1,9 @@
 package binio
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // Cursor is a bounded, order-aware read head over a byte slice.
 //

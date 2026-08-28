@@ -35,7 +35,6 @@ import (
 	"fmt"
 
 	"github.com/vertex-language/macho"
-	"github.com/vertex-language/macho/internal/binio"
 )
 
 // ErrWidth means Decode or Encode was called with an invalid macho.Width.

@@ -183,6 +183,12 @@ type SectionBuilder struct {
 	index int
 	addr  uint64
 	off   uint64
+
+	// relocBase is this section's byte offset into the file's one relocation
+	// table, measured from layout.relocOff. The table is shared and the
+	// entries are grouped by section, so a section header's reloff is the
+	// table's start plus this.
+	relocBase uint64
 }
 
 // relocEntry is one submitted relocation plus its role in a pair.
