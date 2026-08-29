@@ -3,10 +3,13 @@ package link
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/vertex-language/macho"
 	"github.com/vertex-language/macho/ar"
 	"github.com/vertex-language/macho/fat"
+	"github.com/vertex-language/macho/image"
 	"github.com/vertex-language/macho/internal/binio"
 	"github.com/vertex-language/macho/obj"
 	"github.com/vertex-language/macho/tbd"
@@ -31,6 +34,12 @@ type inputFile struct {
 	ar  *ar.File
 	lib Library
 
+	// split is the per-input bookkeeping split.go produces: each section's
+	// atoms and each defining symbol's atom. It is nil until this input has
+	// gone through splitInput, and stays nil for anything that is not an
+	// object.
+	split *splitState
+
 	// forced marks an archive every member of which is loaded regardless of
 	// whether anything references it: -force_load, -all_load, or the ObjC
 	// rule.
@@ -43,6 +52,10 @@ type inputFile struct {
 	// used records whether this library supplied any symbol, which is what
 	// -dead_strip_dylibs acts on.
 	used bool
+
+	// imgInput is this input's image.Input, created on first use so that an
+	// input contributing nothing never appears in the output.
+	imgInput *image.Input
 
 	closer interface{ Close() error }
 }
@@ -115,7 +128,9 @@ func (l *Linker) AddStub(name string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("link: %s: %w", name, err)
 	}
-	return l.addLibrary(name, inputStub, &stubLibrary{s: s}, nil)
+	lib := &stubLibrary{s: s}
+	lib.resolveReexports(l.target, l.sdk)
+	return l.addLibrary(name, inputStub, lib, nil)
 }
 
 // AddDylib adds a dylib as a link input.
@@ -263,28 +278,111 @@ func (l *Linker) Close() error {
 }
 
 // stubLibrary adapts a parsed .tbd to the Library interface.
-type stubLibrary struct{ s *tbd.Stub }
+type stubLibrary struct {
+	s *tbd.Stub
+
+	// reexported holds every transitively re-exported library's stub, keyed
+	// by install name and resolved once by resolveReexports rather than
+	// walked again on every Exports call.
+	//
+	// libSystem.tbd defines almost nothing itself: real symbols like _getpid
+	// or _malloc live in libsystem_kernel.dylib and libsystem_c.dylib, which
+	// it re-exports rather than restates. A two-level namespace link that
+	// only sees libSystem's own exports resolves almost nothing a real
+	// program calls, which is why this exists.
+	reexported map[string]*tbd.Stub
+}
 
 func (l *stubLibrary) InstallName() string            { return l.s.InstallName }
 func (l *stubLibrary) CurrentVersion() macho.Version  { return l.s.CurrentVersion }
 func (l *stubLibrary) CompatVersion() macho.Version   { return l.s.CompatVersion }
 func (l *stubLibrary) Clients(t macho.Target) []string { return l.s.Clients(t) }
 
-// Exports returns the stub's exported and re-exported symbols together.
+// resolveReexports walks this stub's re-exported libraries to a fixpoint,
+// finding each one's own stub either inlined in the same .tbd file — the
+// common case for an umbrella like libSystem.tbd, which bundles every library
+// it re-exports as extra YAML documents in one file — or, failing that, under
+// sdk by install name. sdk may be empty, in which case only inlined stubs are
+// found.
+//
+// A library a real SDK does not ship a stub for, or which resolveReexports
+// simply cannot find, is skipped rather than failing the whole link: most
+// programs never reference its symbols, and a link that fails on every
+// unrelated re-export would be unusable.
+func (l *stubLibrary) resolveReexports(t macho.Target, sdk string) {
+	l.reexported = make(map[string]*tbd.Stub)
+	seen := map[string]bool{l.s.InstallName: true}
+	queue := append([]string(nil), l.s.ReexportedLibraries(t)...)
+
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		sub := findInlined(l.s, name)
+		if sub == nil && sdk != "" {
+			sub, _ = loadStubFromSDK(sdk, name)
+		}
+		if sub == nil {
+			continue
+		}
+		l.reexported[name] = sub
+		queue = append(queue, sub.ReexportedLibraries(t)...)
+	}
+}
+
+func findInlined(top *tbd.Stub, installName string) *tbd.Stub {
+	for _, in := range top.Inlined {
+		if in.InstallName == installName {
+			return in
+		}
+	}
+	return nil
+}
+
+// loadStubFromSDK reads the .tbd for a re-exported library's install name
+// from under an SDK root, e.g. "/usr/lib/system/libsystem_kernel.dylib"
+// becomes "<sdk>/usr/lib/system/libsystem_kernel.tbd".
+func loadStubFromSDK(sdk, installName string) (*tbd.Stub, error) {
+	rel := strings.TrimSuffix(installName, filepath.Ext(installName)) + ".tbd"
+	data, err := os.ReadFile(filepath.Join(sdk, rel))
+	if err != nil {
+		return nil, err
+	}
+	return tbd.Parse(data)
+}
+
+// Exports returns the stub's exported and re-exported symbols together,
+// including everything reachable through resolveReexports.
 //
 // They are merged here because both are names this library's ordinal binds,
 // which is all resolution cares about. The distinction matters only to a
 // diagnostic that wants to say where a definition actually lives, and that
 // belongs to the error path rather than to the lookup.
 func (l *stubLibrary) Exports(t macho.Target) []Export {
-	syms := l.s.Exports(t)
-	out := make([]Export, 0, len(syms))
-	for _, s := range append(syms, l.s.Reexported(t)...) {
-		out = append(out, Export{
-			Name:        s.Name,
-			Weak:        s.Kind == tbd.Weak,
-			ThreadLocal: s.Kind == tbd.ThreadLocal,
-		})
+	seen := make(map[string]bool)
+	var out []Export
+	add := func(syms []tbd.Symbol) {
+		for _, s := range syms {
+			if seen[s.Name] {
+				continue
+			}
+			seen[s.Name] = true
+			out = append(out, Export{
+				Name:        s.Name,
+				Weak:        s.Kind == tbd.Weak,
+				ThreadLocal: s.Kind == tbd.ThreadLocal,
+			})
+		}
+	}
+	add(l.s.Exports(t))
+	add(l.s.Reexported(t))
+	for _, sub := range l.reexported {
+		add(sub.Exports(t))
+		add(sub.Reexported(t))
 	}
 	return out
 }

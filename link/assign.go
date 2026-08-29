@@ -109,6 +109,15 @@ func (l *Linker) assignAddresses(img *image.Image) error {
 			continue
 		}
 
+		if seg.Name == macho.SEG_DATA_CONST || seg.Name == macho.SEG_AUTH_CONST {
+			// Writable at the page-protection level so fixups can be applied,
+			// but SG_READ_ONLY tells dyld to mprotect it read-only once they
+			// are — the whole reason these segments exist apart from __DATA.
+			// A modern dyld refuses to load an image where they claim this
+			// name without also claiming the flag.
+			seg.Flags |= macho.SG_READ_ONLY
+		}
+
 		segAddr := alignUp(addr, page)
 		segOff := segAddr - base
 
@@ -425,6 +434,12 @@ type linkeditPlan struct {
 	Symtab          []byte
 	IndirectSymbols []byte
 	Strtab          []byte
+
+	// offsets holds each table's absolute file offset, in the same order as
+	// tables(), filled in by commit once __LINKEDIT is placed. A load command
+	// that needs where a table landed reads it back through at, rather than
+	// recomputing the layout commit already did.
+	offsets [7]uint64
 }
 
 func (p *linkeditPlan) tables() [][]byte {
@@ -432,6 +447,11 @@ func (p *linkeditPlan) tables() [][]byte {
 		p.ChainedFixups, p.ExportTrie, p.FunctionStarts, p.DataInCode,
 		p.Symtab, p.IndirectSymbols, p.Strtab,
 	}
+}
+
+// at returns table i's absolute file offset and size, as placed by commit.
+func (p *linkeditPlan) at(i int) (uint64, uint32) {
+	return p.offsets[i], uint32(len(p.tables()[i]))
 }
 
 // commit sizes __LINKEDIT, reserves the signature, and freezes the image.
@@ -444,8 +464,9 @@ func (l *Linker) commit(img *image.Image) error {
 	page := img.PageSize()
 
 	off := l.leOff
-	for _, t := range l.le.tables() {
+	for i, t := range l.le.tables() {
 		off = alignUp(off, word)
+		l.le.offsets[i] = off
 		off += uint64(len(t))
 	}
 
@@ -469,7 +490,26 @@ func (l *Linker) commit(img *image.Image) error {
 	if err := img.SetSize(total); err != nil {
 		return err
 	}
-	return img.Freeze()
+	if err := img.Freeze(); err != nil {
+		return err
+	}
+	return l.writeLinkedit(img)
+}
+
+// writeLinkedit copies every __LINKEDIT table into the frozen buffer at the
+// offsets commit just assigned. It has to run after Freeze, since nothing may
+// be written before the buffer exists.
+func (l *Linker) writeLinkedit(img *image.Image) error {
+	for i, t := range l.le.tables() {
+		if len(t) == 0 {
+			continue
+		}
+		off, _ := l.le.at(i)
+		if err := img.WriteAt(off, t); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // signingIdentifier is the name the CodeDirectory records.

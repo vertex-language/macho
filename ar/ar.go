@@ -100,6 +100,15 @@ const (
 	Symdef64SortedName = "__.SYMDEF_64 SORTED"
 )
 
+// IsArchive reports whether data begins with the ar file magic.
+//
+// It is a prefix check only, the same way macho.Is and macho.IsFat are: cheap
+// enough to call while classifying an input by content rather than extension,
+// and making no claim about whether the rest of the file parses.
+func IsArchive(data []byte) bool {
+	return len(data) >= MagicSize && string(data[:MagicSize]) == Magic
+}
+
 // IsSymdef reports whether name is one of the four table-of-contents names.
 func IsSymdef(name string) bool {
 	switch name {

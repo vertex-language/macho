@@ -35,6 +35,16 @@ func (l *Linker) order(img *image.Image) error {
 	}
 	l.orderAtoms(img)
 
+	// __LINKEDIT carries no sections, so nothing upstream ever asks for it by
+	// asking for a section. It still has to exist before Seal, which is the
+	// last point new segments may be created — and it has to be created last,
+	// since assignAddresses places segments in Segments() order and reads the
+	// address __LINKEDIT starts at off the cursor every other segment left
+	// behind.
+	if _, err := img.Segment(macho.SEG_LINKEDIT); err != nil {
+		return err
+	}
+
 	if err := img.Seal(); err != nil {
 		return err
 	}
@@ -166,8 +176,9 @@ type gotSynthetic struct {
 	l     *Linker
 	shape backend.GotShape
 
-	sec *image.Section
-	src *image.RawSource
+	sec  *image.Section
+	src  *image.RawSource
+	atom *image.Atom
 }
 
 func (g *gotSynthetic) SyntheticName() string { return g.shape.Name.String() }
@@ -191,11 +202,38 @@ func (g *gotSynthetic) Prepare(img *image.Image) error {
 	if err := sec.SetIndirectIndex(0); err != nil {
 		return err
 	}
-	return g.l.addSynthetic(sec, &image.Atom{
+	g.atom = &image.Atom{
 		Name:   "<got>",
 		Source: g.src,
 		Align:  g.shape.Align,
-	})
+	}
+	if err := g.l.addSynthetic(sec, g.atom); err != nil {
+		return err
+	}
+
+	// Every GOT slot is a pointer dyld must fix up at load time: a bind for a
+	// slot targeting an import, since only dyld knows where that symbol
+	// landed, and a rebase for one targeting something in this image, since
+	// even a link-time-final address has to slide with ASLR. Generate writes
+	// the bytes for the rebase case directly and leaves the bind case zero,
+	// but writing bytes is not registering the fixup — nothing else does, and
+	// an unregistered fixup is dyld reading whatever Generate left behind.
+	entry := uint64(g.shape.EntrySize)
+	for i, sym := range g.l.reqs.GOTSyms() {
+		off := uint64(i) * entry
+		if sym.Defined() {
+			if err := g.l.reqs.AddRebase(backend.Rebase{Atom: g.atom, Offset: off}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := g.l.reqs.AddBind(backend.Bind{
+			Atom: g.atom, Offset: off, Sym: sym, Weak: sym.WeakRef,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (g *gotSynthetic) Generate(img *image.Image) error {
@@ -370,18 +408,11 @@ func (s *stubSynthetic) Generate(img *image.Image) error {
 
 		var ptrAddr uint64
 		if lazy {
-			ptrAddr = s.ptrs.Addr + uint64(i)*word
-			entryAddr := s.shape.HelperEntry(s.helper.Addr, i)
-			off := uint64(s.shape.HelperHeaderSize) + uint64(i)*uint64(s.shape.HelperEntrySize)
-
 			// The lazy bind stream is fixups.go's, and it does not exist. A
 			// zero offset points every entry at the first opcode, which binds
 			// the wrong symbol rather than failing — so it is reported here
 			// instead of written.
 			return fmt.Errorf("%w: lazy bind offsets come from fixups.go", ErrUnimplemented)
-
-			_ = off
-			_ = entryAddr
 		} else {
 			var err error
 			if ptrAddr, err = s.gotSlot(sym); err != nil {

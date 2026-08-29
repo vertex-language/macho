@@ -35,7 +35,39 @@ type Reqs struct {
 
 	rebases []Rebase
 	binds   []Bind
+
+	hints []Hint
 }
+
+// Hint is one LC_LINKER_OPTIMIZATION_HINT entry, resolved to the atoms and
+// offsets its instructions now live at.
+//
+// link collects these from the input objects, since resolving an instruction
+// address to an atom needs obj.File, which a backend never sees. A Relaxer
+// reads them back out through Reqs to decide what it may collapse.
+type Hint struct {
+	// Kind is the hint's LOH_ARM64_* opcode, carried as an opaque byte because
+	// only the backend's Relaxer knows what to do with it.
+	Kind uint8
+
+	// Sites are the hint's instructions, in the order the compiler recorded
+	// them, each resolved to the atom and offset that now hold it.
+	Sites []HintSite
+}
+
+// HintSite is one instruction named by a Hint.
+type HintSite struct {
+	Atom   *image.Atom
+	Offset uint64
+}
+
+// SetHints records the resolved optimization hints for this link. link calls
+// it once, before the first call to a Relaxer.
+func (r *Reqs) SetHints(hints []Hint) { r.hints = hints }
+
+// Hints returns the resolved optimization hints, in the order link collected
+// them.
+func (r *Reqs) Hints() []Hint { return r.hints }
 
 // NewReqs returns an empty Reqs.
 func NewReqs() *Reqs { return &Reqs{} }

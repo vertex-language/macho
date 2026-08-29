@@ -52,9 +52,16 @@ const (
 // fixups builds the LC_DYLD_CHAINED_FIXUPS payload and arranges for the chains
 // themselves to be threaded through the data.
 func (l *Linker) fixups(img *image.Image) error {
-	if l.reqs.Fixups() == 0 {
+	if len(l.libs) == 0 {
+		// Nothing dynamic to fix up against; the classic static case, which
+		// this tree does not otherwise produce.
 		return nil
 	}
+	// dyld expects a chained-fixups header to be present and well-formed
+	// whenever the command exists at all, even with nothing to rebase or
+	// bind — the header with a zero-entry import table is what "nothing to
+	// do" looks like on disk. A present LC_DYLD_CHAINED_FIXUPS with a
+	// zero-size payload is what "malformed import table" means to dyld.
 	format, err := l.pointerFormat()
 	if err != nil {
 		return err

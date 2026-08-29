@@ -1,6 +1,7 @@
 package link
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 
@@ -329,7 +330,27 @@ func (s *signFinalizer) Finalize(img *image.Image) error {
 	if !img.CodeSignatureReserved() {
 		return fmt.Errorf("link: no code signature slot was reserved")
 	}
-	return codesign.SignImage(img, codesign.Options{
-		Identifier: s.l.signingIdentifier(),
-	})
+	sigOff, sigSize := img.CodeSignature()
+
+	text := img.FindSegment(macho.SEG_TEXT)
+	if text == nil {
+		return fmt.Errorf("link: the image has no %s segment", macho.SEG_TEXT)
+	}
+
+	id := s.l.signingIdentifier()
+	need := uint64(codesign.Size(int64(sigOff), id))
+	if need > sigSize {
+		return fmt.Errorf("link: code signature needs %d bytes, only %d were reserved", need, sigSize)
+	}
+
+	data, err := img.Bytes()
+	if err != nil {
+		return err
+	}
+	isMain := s.l.opts.Output == OutputExecute
+
+	out := make([]byte, need)
+	codesign.Sign(out, bytes.NewReader(data[:sigOff]), id, int64(sigOff),
+		int64(text.FileOff), int64(text.FileSize), isMain)
+	return img.WriteAt(sigOff, out)
 }

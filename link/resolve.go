@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/vertex-language/macho"
+	"github.com/vertex-language/macho/ar"
 	"github.com/vertex-language/macho/image"
 	"github.com/vertex-language/macho/obj"
 )
@@ -48,6 +49,11 @@ type resolution struct {
 	// extracted records which members have been pulled in, so a member
 	// defining several needed symbols is extracted once.
 	extracted map[archiveMember]bool
+
+	// coalesced maps a losing definition to the symbol that won over it, so
+	// split can redirect a coalesced-away nlist entry to the atom that
+	// actually survives.
+	coalesced map[definition]*image.Sym
 }
 
 // definition is the winning definition of a symbol.

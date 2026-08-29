@@ -407,7 +407,7 @@ func (img *Image) AddReserved() error {
 	}
 	for _, n := range names {
 		s := img.syms.Intern(n)
-		s.Class = ClassDefined
+		s.Class = ClassAbsolute
 		s.Reserved = true
 		s.Root = true
 		img.reserved = append(img.reserved, s)

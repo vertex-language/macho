@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/vertex-language/macho"
+	"github.com/vertex-language/macho/backend"
 	"github.com/vertex-language/macho/image"
 	"github.com/vertex-language/macho/internal/binio"
 	"github.com/vertex-language/macho/internal/format"
@@ -323,15 +324,12 @@ func (l *Linker) buildDataInCode(img *image.Image) error {
 
 // backendStubShape is the discovery helper spelled out once so the three
 // callers that need a StubShape do not each write the assertion.
-func backendStubShape(l *Linker) (shape stubShapeAlias, ok bool) {
-	st, ok := backendAsStubber(l)
+func backendStubShape(l *Linker) (shape backend.StubShape, ok bool) {
+	st, ok := backend.AsStubber(l.be)
 	if !ok {
 		return shape, false
 	}
 	return st.StubShape(), true
 }
-
-// The two aliases keep this file from importing backend for one type name.
-type stubShapeAlias = backendStubShapeType
 
 var _ = obj.ErrNoSymbolTable // obj is used by buildDataInCode through in.obj

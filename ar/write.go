@@ -1,6 +1,7 @@
 package ar
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -361,4 +362,4 @@ func (w *Writer) header() Header {
 // field saying which order it used — the reader infers it from whether the
 // size prefix is plausible. Writing anything else would be writing for a
 // target that does not exist here.
-func tocByteOrderOut() binaryByteOrder { return littleEndian }
+func tocByteOrderOut() binary.ByteOrder { return binary.LittleEndian }

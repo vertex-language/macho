@@ -80,9 +80,14 @@ func (l *Linker) splitInput(img *image.Image, in *inputFile) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", sec, err)
 		}
+		if l.atomSection == nil {
+			l.atomSection = make(map[*image.Atom]image.SectionKey)
+		}
+		key := image.SectionKey{Name: sec.SecName(), Type: sec.Type(), Attrs: sec.Attrs()}
 		for _, a := range atoms {
 			a.Input = ii
 			ii.Atoms = append(ii.Atoms, a)
+			l.atomSection[a] = key
 		}
 		st.bySection[sec] = atoms
 		l.atoms = append(l.atoms, atoms...)
@@ -133,7 +138,7 @@ func (l *Linker) splitSection(in *inputFile, sec *obj.Section) ([]*image.Atom, e
 		return l.splitZerofill(in, sec)
 	case isLiteral(sec.Type()):
 		return l.splitLiterals(in, sec)
-	case sec.SecName() == macho.Sec(macho.SEG_LD, sectCompactUnwind) ||
+	case sec.SecName() == macho.Sec(SEG_LD, sectCompactUnwind) ||
 		sec.Name == macho.SECT_COMPACT_UNWIND:
 		return l.splitCompactUnwind(in, sec)
 	case sec.Name == macho.SECT_EH_FRAME:

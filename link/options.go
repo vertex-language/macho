@@ -72,9 +72,9 @@ func (k OutputKind) FileType() macho.FileType {
 type UndefinedTreatment uint8
 
 const (
-	// UndefinedError fails the link. This is the default and very nearly
+	// UndefinedFail fails the link. This is the default and very nearly
 	// always what is wanted.
-	UndefinedError UndefinedTreatment = iota
+	UndefinedFail UndefinedTreatment = iota
 
 	// UndefinedWarning reports and continues, leaving the symbol undefined in
 	// the output.

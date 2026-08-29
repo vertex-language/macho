@@ -32,8 +32,64 @@ type Linker struct {
 	// sdk is the root the .tbd stubs for system libraries are found under.
 	sdk string
 
+	// atoms are the live atoms surviving split and sweep, in the order later
+	// passes assign them addresses.
+	atoms []*image.Atom
+
+	// folded maps a coalesced atom to the survivor that replaced it, so a
+	// reference to a folded atom can be redirected to where it actually landed.
+	folded map[*image.Atom]*image.Atom
+
+	// atomSection records the input section key each atom was split from, so
+	// merge can place it in the matching output section without every caller
+	// re-deriving the mapping from the atom's obj.Section.
+	atomSection map[*image.Atom]image.SectionKey
+
+	// thunks deduplicates range-extension thunks by target and caller region,
+	// so two call sites reaching the same far symbol share one veneer.
+	thunks map[thunkKey]*image.Atom
+	// thunkList is thunks in placement order, which is the order Apply needs
+	// to write their bytes.
+	thunkList []thunkRec
+
+	// hints are the resolved LC_LINKER_OPTIMIZATION_HINT sites, collected
+	// once and cached across relax's repeated calls inside the layout
+	// fixpoint.
+	hints     []backend.Hint
+	hintsDone bool
+
+	// cu is every decoded __compact_unwind record, consumed while building
+	// the synthetic __TEXT,__unwind_info section.
+	cu []cuEntry
+
+	// le is the __LINKEDIT content, filled in as each table is built and
+	// placed once, in commit.
+	le linkeditPlan
+	// leAddr and leOff are __LINKEDIT's vmaddr and file offset, fixed once
+	// its segment is placed and read back by commit to lay out the tables in
+	// order.
+	leAddr, leOff uint64
+
+	// symIndex maps a symbol to its slot in the symbol table being built, so
+	// relocations and indirect-symbol entries can name a symbol by index.
+	symIndex map[*image.Sym]int
+	nLocal   uint32
+	nExtDef  uint32
+	nUndef   uint32
+
+	// uuidOff is the file offset of the UUID load command's 16-byte payload,
+	// recorded when the command is emitted so finalize can fill it in once
+	// every other byte of the image is final.
+	uuidOff uint64
+
 	done bool
 	err  error
+
+	// Warn, if set, is called for every non-fatal diagnostic: a symbol
+	// resolved under UndefinedWarning, for instance. A nil Warn discards
+	// them, the same as ld's default of printing nothing for anything short
+	// of an error.
+	Warn func(error)
 }
 
 // New returns a Linker for a target.
@@ -189,6 +245,15 @@ func (l *Linker) Link() (*image.Image, error) {
 	if err := img.AddReserved(); err != nil {
 		return nil, err
 	}
+	// __PAGEZERO, when there is one, must be the image's first segment: it
+	// sits at address zero and everything else is placed after it. Created
+	// here, before anything else asks for a segment, so creation order is
+	// output order.
+	if img.PageZeroSize() > 0 {
+		if _, err := img.Segment(macho.SEG_PAGEZERO); err != nil {
+			return nil, err
+		}
+	}
 
 	// 1. Symbols, the archive fixpoint, weak definitions, and library
 	//    ordinals.
@@ -206,14 +271,20 @@ func (l *Linker) Link() (*image.Image, error) {
 		{"split", l.split},
 		{"sweep", l.sweep},
 		{"check undefined", l.checkUndefined},
+		// unwind consumes __compact_unwind atoms and reserves personality GOT
+		// slots; it must run before merge places atoms into output sections
+		// and before scan sizes the GOT, or it is discovering both too late.
+		{"unwind", l.unwind},
 		{"merge", l.merge},
 		{"scan", l.scan},
 		{"order", l.order},
 		{"layout", l.layout},
-		{"contents", l.contents},
-		{"unwind", l.unwind},
+		// fixups and linkedit build __LINKEDIT's tables from final addresses;
+		// contents' commit sizes and places __LINKEDIT and freezes the image,
+		// so it must run after them, not before.
 		{"fixups", l.fixups},
 		{"linkedit", l.linkedit},
+		{"contents", l.contents},
 		{"emit", l.emit},
 		{"finalize", l.finalize},
 	} {
@@ -242,34 +313,6 @@ func (l *Linker) headerFlags() macho.Flags {
 		f &^= macho.MH_NOUNDEFS
 	}
 	return f
-}
-
-// --------------------------------------------------------------------------
-// Pipeline steps not yet written.
-//
-// These are declared here so the package compiles and the sequence in Link
-// reads as the whole pipeline rather than the part that happens to exist. Each
-// moves to its own file as it is implemented — delete the stub here when you
-// add the real method, or the compiler will report a redeclaration, which is
-// the intended reminder.
-// --------------------------------------------------------------------------
-
-func (l *Linker) split(*image.Image) error {
-	return fmt.Errorf("%w: split.go", ErrUnimplemented)
-}
-func (l *Linker) sweep(*image.Image) error  { return fmt.Errorf("%w: sweep.go", ErrUnimplemented) }
-func (l *Linker) merge(*image.Image) error  { return fmt.Errorf("%w: merge.go", ErrUnimplemented) }
-func (l *Linker) order(*image.Image) error  { return fmt.Errorf("%w: order.go", ErrUnimplemented) }
-func (l *Linker) layout(*image.Image) error { return fmt.Errorf("%w: assign.go", ErrUnimplemented) }
-func (l *Linker) contents(*image.Image) error {
-	return fmt.Errorf("%w: apply.go", ErrUnimplemented)
-}
-func (l *Linker) unwind(*image.Image) error   { return fmt.Errorf("%w: unwind.go", ErrUnimplemented) }
-func (l *Linker) fixups(*image.Image) error   { return fmt.Errorf("%w: fixups.go", ErrUnimplemented) }
-func (l *Linker) linkedit(*image.Image) error { return fmt.Errorf("%w: linkedit.go", ErrUnimplemented) }
-func (l *Linker) emit(*image.Image) error     { return fmt.Errorf("%w: emit.go", ErrUnimplemented) }
-func (l *Linker) finalize(*image.Image) error {
-	return fmt.Errorf("%w: image.Finalize wiring", ErrUnimplemented)
 }
 
 // scan is the backend's sizing pass. It is a one-liner and is here rather than
