@@ -2,6 +2,10 @@ package link_test
 
 import (
 	"bytes"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/vertex-language/macho"
@@ -151,5 +155,104 @@ func TestLinkExecutable(t *testing.T) {
 	// and placed the tables but nothing wrote them.
 	if bytes.Count(out[:sigOff], []byte{0}) == int(sigOff) {
 		t.Fatal("the entire pre-signature region is zero; nothing was written")
+	}
+}
+
+// realLibSystemTBD returns a real libSystem.tbd from the toolchain, or "" if
+// none of the known SDK layouts are present on this machine.
+func realLibSystemTBD() string {
+	candidates := []string{
+		"/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libSystem.tbd",
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// TestLinkRealCompilerOutput compiles real C source with the system clang —
+// a function call, a conditional, and a call into libSystem that never
+// returns — links the resulting object against the real libSystem.tbd, and
+// (on arm64 macOS, where the produced binary can actually run) executes it.
+//
+// This exercises re-export resolution against the real libSystem.tbd rather
+// than the minimal fake used by TestLinkExecutable, and end-to-end fixup
+// correctness against object code this package did not itself construct.
+func TestLinkRealCompilerOutput(t *testing.T) {
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skip("clang not found on PATH")
+	}
+	tbdPath := realLibSystemTBD()
+	if tbdPath == "" {
+		t.Skip("no known libSystem.tbd found on this machine")
+	}
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "t.c")
+	objPath := filepath.Join(dir, "t.o")
+	if err := os.WriteFile(src, []byte(`
+#include <unistd.h>
+int helper(int x) { return x + 1; }
+int main(void) {
+	int r = helper(41);
+	_exit(r == 42 ? 0 : 1);
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cmd := exec.Command(clang, "-c", "-target", "arm64-apple-macos14.0", "-O0", "-o", objPath, src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clang failed: %v\n%s", err, out)
+	}
+
+	target, err := macho.ParseTarget("arm64-apple-macos14.0")
+	if err != nil {
+		t.Fatalf("ParseTarget: %v", err)
+	}
+	l, err := link.New(target)
+	if err != nil {
+		t.Fatalf("link.New: %v", err)
+	}
+	defer l.Close()
+
+	objData, err := os.ReadFile(objPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if err := l.AddObject("t.o", objData); err != nil {
+		t.Fatalf("AddObject: %v", err)
+	}
+	tbdData, err := os.ReadFile(tbdPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", tbdPath, err)
+	}
+	if err := l.AddStub("libSystem", tbdData); err != nil {
+		t.Fatalf("AddStub: %v", err)
+	}
+	l.Options().Output = link.OutputExecute
+	l.SetEntry("_main")
+
+	img, err := l.Link()
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	out, err := img.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+
+	exePath := filepath.Join(dir, "a.out")
+	if err := os.WriteFile(exePath, out, 0o755); err != nil {
+		t.Fatalf("WriteFile(exe): %v", err)
+	}
+
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("built the executable; running it needs arm64 macOS")
+	}
+	if err := exec.Command(exePath).Run(); err != nil {
+		t.Fatalf("running the linked binary: %v", err)
 	}
 }

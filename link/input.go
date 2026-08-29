@@ -322,7 +322,7 @@ func (l *stubLibrary) resolveReexports(t macho.Target, sdk string) {
 		}
 		seen[name] = true
 
-		sub := findInlined(l.s, name)
+		sub := l.s.Find(name)
 		if sub == nil && sdk != "" {
 			sub, _ = loadStubFromSDK(sdk, name)
 		}
@@ -332,15 +332,6 @@ func (l *stubLibrary) resolveReexports(t macho.Target, sdk string) {
 		l.reexported[name] = sub
 		queue = append(queue, sub.ReexportedLibraries(t)...)
 	}
-}
-
-func findInlined(top *tbd.Stub, installName string) *tbd.Stub {
-	for _, in := range top.Inlined {
-		if in.InstallName == installName {
-			return in
-		}
-	}
-	return nil
 }
 
 // loadStubFromSDK reads the .tbd for a re-exported library's install name
