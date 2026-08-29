@@ -362,8 +362,17 @@ func signSlice(s *Slice, opts Options) error {
 	}
 
 	// ── Embed ──────────────────────────────────────────────────────────────────
-	// At this point, embedSignature should only be appending the bytes,
-	// as s.PatchHeaders() already updated the LC_CODE_SIGNATURE & __LINKEDIT sizes.
+	// The header was already patched from a dummy signature's size, as an
+	// estimate computed before the real one could exist. That estimate is
+	// usually exact, but not always: an ECDSA signature's DER encoding varies
+	// by a byte or two between signing attempts depending on whether the
+	// random nonce produces an R or S with its high bit set, so the dummy and
+	// real CMS blobs built from two independent signing operations can differ
+	// in length. A stale DataSize/__LINKEDIT size here is not cosmetic — it
+	// makes the file one dyld and codesign disagree about, or reject outright.
+	if len(super) != expectedSigSize {
+		s.PatchHeaders(len(super), codeLimit)
+	}
 	if err := s.embedSignature(super, codeLimit); err != nil {
 		return err
 	}

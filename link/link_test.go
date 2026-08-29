@@ -158,6 +158,30 @@ func TestLinkExecutable(t *testing.T) {
 	}
 }
 
+// TestAddRPathRejectsDuplicate checks that a repeated -rpath is caught here
+// rather than emitted twice: recent versions of ld require every LC_RPATH to
+// be unique.
+func TestAddRPathRejectsDuplicate(t *testing.T) {
+	target, err := macho.ParseTarget("arm64-apple-macos14.0")
+	if err != nil {
+		t.Fatalf("ParseTarget: %v", err)
+	}
+	l, err := link.New(target)
+	if err != nil {
+		t.Fatalf("link.New: %v", err)
+	}
+	defer l.Close()
+
+	l.AddRPath("@executable_path/../Frameworks")
+	if l.Err() != nil {
+		t.Fatalf("first AddRPath failed: %v", l.Err())
+	}
+	l.AddRPath("@executable_path/../Frameworks")
+	if l.Err() == nil {
+		t.Error("a duplicate -rpath should have failed the link")
+	}
+}
+
 // realLibSystemTBD returns a real libSystem.tbd from the toolchain, or "" if
 // none of the known SDK layouts are present on this machine.
 func realLibSystemTBD() string {
@@ -254,5 +278,97 @@ int main(void) {
 	}
 	if err := exec.Command(exePath).Run(); err != nil {
 		t.Fatalf("running the linked binary: %v", err)
+	}
+}
+
+// TestLinkDylibExportsAreCallable links a trivial dylib, then loads it with
+// the real dyld through dlopen and calls its exported function by name
+// through dlsym — proof that LC_ID_DYLIB, the export trie, and two-level
+// namespace symbol export are not just present but actually usable.
+func TestLinkDylibExportsAreCallable(t *testing.T) {
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skip("clang not found on PATH")
+	}
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("dlopen-ing the result needs arm64 macOS")
+	}
+
+	target, err := macho.ParseTarget("arm64-apple-macos14.0")
+	if err != nil {
+		t.Fatalf("ParseTarget: %v", err)
+	}
+	l, err := link.New(target)
+	if err != nil {
+		t.Fatalf("link.New: %v", err)
+	}
+	defer l.Close()
+
+	// A self-contained function with no nested call: mov w0, #42; ret. Unlike
+	// buildObject, this deliberately never calls anything else, so there is
+	// no link register to save and restore — the point of this test is the
+	// dylib export/dlsym path, not another exercise of relocations that
+	// buildObject already covers via a call that never returns.
+	var objBuf bytes.Buffer
+	ow := obj.NewWriter(&objBuf, obj.Options{
+		Target: target, Flags: macho.MH_SUBSECTIONS_VIA_SYMBOLS, Build: target.Build(),
+	})
+	text := ow.Section(obj.SectionHeader{
+		Segment: macho.SEG_TEXT, Name: macho.SECT_TEXT,
+		Type: macho.S_REGULAR, Attrs: macho.S_ATTR_PURE_INSTRUCTIONS, Align: 4,
+	})
+	text.Write([]byte{0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6}) // mov w0,#42; ret
+	ow.Symbol(obj.SymbolDef{Name: "_answer", Type: macho.N_SECT, Ext: true, Section: text})
+	if err := ow.Close(); err != nil {
+		t.Fatalf("obj.Writer.Close: %v", err)
+	}
+
+	if err := l.AddObject("t.o", objBuf.Bytes()); err != nil {
+		t.Fatalf("AddObject: %v", err)
+	}
+	if err := l.AddStub("libSystem", []byte(fakeLibSystem)); err != nil {
+		t.Fatalf("AddStub: %v", err)
+	}
+	l.Options().Output = link.OutputDylib
+	l.SetInstallName("@rpath/libmachotest.dylib")
+	l.SetDylibVersions(macho.MustParseVersion("1.0"), macho.MustParseVersion("1.0"))
+
+	img, err := l.Link()
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	out, err := img.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+
+	dir := t.TempDir()
+	dylibPath := filepath.Join(dir, "libmachotest.dylib")
+	if err := os.WriteFile(dylibPath, out, 0o755); err != nil {
+		t.Fatalf("WriteFile(dylib): %v", err)
+	}
+
+	harnessSrc := filepath.Join(dir, "harness.c")
+	harness := filepath.Join(dir, "harness")
+	if err := os.WriteFile(harnessSrc, []byte(`
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+	void *h = dlopen(argv[1], RTLD_NOW);
+	if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+	int (*fn)(void) = (int (*)(void))dlsym(h, "answer");
+	if (!fn) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+	int got = fn();
+	if (got != 42) { fprintf(stderr, "answer() = %d, want 42\n", got); return 1; }
+	return 0;
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(harness.c): %v", err)
+	}
+	if out, err := exec.Command(clang, "-o", harness, harnessSrc).CombinedOutput(); err != nil {
+		t.Fatalf("compiling the dlopen harness: %v\n%s", err, out)
+	}
+	if out, err := exec.Command(harness, dylibPath).CombinedOutput(); err != nil {
+		t.Fatalf("dlopen/dlsym harness failed: %v\n%s", err, out)
 	}
 }

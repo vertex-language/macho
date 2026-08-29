@@ -153,7 +153,21 @@ func (l *Linker) KeepPrivateExterns(v bool)    { l.opts.KeepPrivateExterns = v }
 func (l *Linker) DeadStrip(v bool)             { l.opts.DeadStrip = v }
 func (l *Linker) LoadAllObjC(v bool)           { l.opts.LoadAllObjC = v }
 func (l *Linker) ForceLoad(path string)        { l.opts.ForceLoad = append(l.opts.ForceLoad, path) }
-func (l *Linker) AddRPath(p string)            { l.opts.RPaths = append(l.opts.RPaths, p) }
+// AddRPath adds an LC_RPATH entry.
+//
+// A duplicate is rejected rather than silently emitted twice: recent versions
+// of ld require every LC_RPATH to be unique and a binary with a repeated one
+// draws a linker warning at best, so failing here catches it at the same
+// place a real build would.
+func (l *Linker) AddRPath(p string) {
+	for _, existing := range l.opts.RPaths {
+		if existing == p {
+			l.fail(fmt.Errorf("link: -rpath %s given twice", p))
+			return
+		}
+	}
+	l.opts.RPaths = append(l.opts.RPaths, p)
+}
 func (l *Linker) SetSDK(root string)           { l.sdk = root }
 
 func (l *Linker) SetUndefinedTreatment(t UndefinedTreatment) { l.opts.Undefined = t }
