@@ -108,11 +108,17 @@ type fixupSite struct {
 	off    uint64 // file offset of the pointer
 	seg    int    // index into the image's segment list
 	bind   bool
-	target uint64 // rebase: offset from the header
 	ordinal uint32 // bind: index into the import table
 	addend  uint64
 	sym     *image.Sym
 	weak    bool
+
+	// atom and roff locate a rebase's pointer for the read that recovers its
+	// target. The value is not read here: this pass runs before contents
+	// freezes the image and before apply.go writes the pointer, so there is
+	// nothing to read yet — the chain finalizer does it, after both.
+	atom *image.Atom
+	roff uint64
 }
 
 // fixupSites resolves every recorded rebase and bind to an address, and sorts
@@ -123,7 +129,6 @@ type fixupSite struct {
 // it is not address order, and threading an unsorted list produces negative
 // deltas that do not fit the field.
 func (l *Linker) fixupSites(img *image.Image) ([]fixupSite, error) {
-	base := img.BaseAddress()
 	segs := img.Segments()
 
 	out := make([]fixupSite, 0, l.reqs.Fixups())
@@ -159,19 +164,7 @@ func (l *Linker) fixupSites(img *image.Image) ([]fixupSite, error) {
 		if r.Auth != nil {
 			return nil, fmt.Errorf("%w: authenticated rebase in %s", ErrUnimplemented, atomWhere(r.Atom))
 		}
-		// The pointer currently holds the address apply.go computed. The
-		// chain entry stores it as an offset from the header, because dyld
-		// adds the slide and an absolute address would be wrong by the base
-		// in every process.
-		site, err := backend.SiteFor(img, r.Atom, l.reqs)
-		if err != nil {
-			return nil, err
-		}
-		v, err := site.ReadN(r.Offset, l.be.WordSize())
-		if err != nil {
-			return nil, err
-		}
-		s := fixupSite{target: v - base}
+		s := fixupSite{atom: r.Atom, roff: r.Offset}
 		if err := add(r.Atom, r.Offset, &s); err != nil {
 			return nil, err
 		}
@@ -368,6 +361,20 @@ func encodeChainedFixups(img *image.Image, sites []fixupSite, imports []chainedI
 
 func align32(v, n uint32) uint32 { return (v + n - 1) &^ (n - 1) }
 
+// rebaseTarget recovers the address a rebased pointer already holds, as an
+// offset from the image's base.
+func (c *chainFinalizer) rebaseTarget(img *image.Image, s fixupSite) (uint64, error) {
+	site, err := backend.SiteFor(img, s.atom, c.l.reqs)
+	if err != nil {
+		return 0, err
+	}
+	v, err := site.ReadN(s.roff, c.l.be.WordSize())
+	if err != nil {
+		return 0, err
+	}
+	return v - img.BaseAddress(), nil
+}
+
 // chainFinalizer threads the chains through the image's pointers.
 type chainFinalizer struct {
 	l      *Linker
@@ -412,11 +419,23 @@ func (c *chainFinalizer) Finalize(img *image.Image) error {
 						next<<51 |
 						1<<63
 				} else {
-					if s.target >= 1<<36 {
-						return fmt.Errorf("link: rebase target 0x%x exceeds the 36-bit field; "+
-							"the image is larger than 64 GB", s.target)
+					// The pointer holds the address apply.go computed. The
+					// chain entry stores it as an offset from the header,
+					// because dyld adds the slide and an absolute address
+					// would be wrong by the base in every process.
+					//
+					// Read here rather than when the site was collected: that
+					// pass runs before the image is frozen and before apply
+					// has written anything, so the bytes did not exist yet.
+					target, err := c.rebaseTarget(img, s)
+					if err != nil {
+						return err
 					}
-					v = s.target | next<<51
+					if target >= 1<<36 {
+						return fmt.Errorf("link: rebase target 0x%x exceeds the 36-bit field; "+
+							"the image is larger than 64 GB", target)
+					}
+					v = target | next<<51
 				}
 				buf := make([]byte, 8)
 				img.Endian().Order().PutUint64(buf, v)
