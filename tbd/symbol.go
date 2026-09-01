@@ -104,6 +104,10 @@ func (s *Stub) Undefineds(t macho.Target) []Symbol {
 // target. Following them is how libSystem resolves: it defines almost nothing
 // itself and re-exports a dozen libraries under /usr/lib/system.
 func (s *Stub) ReexportedLibraries(t macho.Target) []string {
+	t, ok := s.resolve(t)
+	if !ok {
+		return nil
+	}
 	var out []string
 	for _, g := range s.libs {
 		if matchesAny(g.targets, t) {
@@ -117,6 +121,10 @@ func (s *Stub) ReexportedLibraries(t macho.Target) []string {
 // only those clients may link against the library; anything else is an error
 // the linker is expected to raise.
 func (s *Stub) Clients(t macho.Target) []string {
+	t, ok := s.resolve(t)
+	if !ok {
+		return nil
+	}
 	var out []string
 	for _, g := range s.clients {
 		if matchesAny(g.targets, t) {
@@ -127,7 +135,8 @@ func (s *Stub) Clients(t macho.Target) []string {
 }
 
 func (s *Stub) collect(secs []section, t macho.Target) []Symbol {
-	if !s.Supports(t) {
+	t, ok := s.resolve(t)
+	if !ok {
 		return nil
 	}
 	var out []Symbol

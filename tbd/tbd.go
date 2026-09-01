@@ -237,7 +237,13 @@ func decode(tag string, doc *node) (*Stub, error) {
 	if s.exports, err = decodeSections(s, doc.get("exports")); err != nil {
 		return nil, err
 	}
-	if s.reexports, err = decodeSections(s, doc.get("re-exports")); err != nil {
+	// v4 spells the document-level group of re-exported symbols "reexports";
+	// the hyphenated spelling is pre-v4, where at this level it does not
+	// appear at all. Reading only the hyphenated one silently loses every
+	// symbol a v4 stub re-exports — on macOS that is _memcpy, _memset and
+	// _bcmp, which libsystem_c re-exports from the platform library rather
+	// than defining, so the C library links but memcpy does not.
+	if s.reexports, err = decodeSections(s, doc.getAny("reexports", "re-exports")); err != nil {
 		return nil, err
 	}
 	if s.undefineds, err = decodeSections(s, doc.get("undefineds")); err != nil {
@@ -424,12 +430,40 @@ func version(n *node, key string) (macho.Version, error) {
 
 // Supports reports whether the stub covers the given link target.
 func (s *Stub) Supports(t macho.Target) bool {
+	_, ok := s.resolve(t)
+	return ok
+}
+
+// resolve picks the target this document actually serves for a link target,
+// and reports whether it serves one at all.
+//
+// An exact match on both CPU and sub-CPU wins, and is the whole story for a
+// stub that lists the architecture being linked. What makes this more than an
+// identity function is the SDK: since the arm64e transition Apple ships
+// libraries whose stubs name only arm64e-macos — libsystem_c.tbd, and so
+// every symbol in the C library — while ordinary Apple Silicon programs are
+// arm64. Requiring an exact sub-CPU there leaves _printf undefined against
+// the SDK every Mac has, so a document with no exact target falls back to one
+// that agrees on CPU and platform.
+//
+// The fallback is deliberately per-document and not per-section: the chosen
+// sub-CPU is then held fixed while the export sections are filtered, so a
+// stub that does list both arm64 and arm64e still answers an arm64 link with
+// the arm64 sections alone. Taking the union across sub-CPUs instead would
+// hand out symbols that only the other slice defines.
+func (s *Stub) resolve(t macho.Target) (macho.Target, bool) {
 	for _, st := range s.Targets {
 		if st.Matches(t) {
-			return true
+			return t, true
 		}
 	}
-	return false
+	for _, st := range s.Targets {
+		if st.MatchesArch(t) {
+			t.SubCPU = st.SubCPU
+			return t, true
+		}
+	}
+	return t, false
 }
 
 // ArchNames returns every target the stub declares, in file order. It is what

@@ -68,6 +68,24 @@ func (t Target) Matches(want macho.Target) bool {
 	return t.Platform == want.Platform
 }
 
+// MatchesArch is Matches with the sub-CPU ignored: the CPU and the platform
+// agree, but the architecture variant may not. It is the fallback
+// Stub.resolve uses for a document that names no exact target, and is not a
+// substitute for Matches — a stub listing both arm64 and arm64e answers an
+// arm64 link from its arm64 sections, not from the union.
+func (t Target) MatchesArch(want macho.Target) bool {
+	if !t.Known {
+		return false
+	}
+	if t.CPU != want.CPU {
+		return false
+	}
+	if t.Platform == macho.PlatformUnknown {
+		return true
+	}
+	return t.Platform == want.Platform
+}
+
 // parseTargetToken parses a v4 target such as "x86_64-ios-simulator".
 //
 // The split is on the first hyphen only. Every arch name is hyphen-free while
