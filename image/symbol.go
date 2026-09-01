@@ -57,6 +57,13 @@ type Sym struct {
 	Atom  *Atom
 	Value uint64
 
+	// Offset is where in Atom the definition starts. It is zero for the
+	// symbol that begins an atom, which is the ordinary case, and non-zero
+	// for a definition that names a position inside one: an .alt_entry
+	// symbol, or any symbol in an object that did not promise
+	// MH_SUBSECTIONS_VIA_SYMBOLS and so is one atom per section.
+	Offset uint64
+
 	// Bound reports whether Value is meaningful. Reading an address before
 	// binding would yield zero, which is a legal address in a dylib, so the
 	// flag is checked rather than the value compared.

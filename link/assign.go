@@ -213,11 +213,11 @@ func (l *Linker) bindSymbols(img *image.Image) error {
 			if err != nil {
 				return err
 			}
-			// An alt-entry symbol names a position inside its atom, and Sym
-			// has no offset field to carry it — so it binds to the atom's
-			// start. That is wrong for .alt_entry and right for everything
-			// else; fixing it means an Offset on image.Sym.
-			sym.Value, sym.Bound = v, true
+			// Offset is zero for the symbol that begins the atom, which is
+			// the ordinary case. It is the distance into the atom for an
+			// alt entry, and for a definition in a section that was never
+			// cut at symbol boundaries.
+			sym.Value, sym.Bound = v+sym.Offset, true
 
 		case image.ClassAbsolute:
 			sym.Bound = true

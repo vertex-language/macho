@@ -39,8 +39,20 @@ type splitState struct {
 	// which is what makes the address lookup a binary search.
 	bySection map[*obj.Section][]*image.Atom
 
-	// bySymbol maps a defining nlist entry to the atom it begins.
-	bySymbol map[*obj.Symbol]*image.Atom
+	// bySymbol maps a defining nlist entry to the atom that carries it, and
+	// to where inside that atom the definition starts. The offset is zero for
+	// the symbol that begins an atom; it is non-zero for an .alt_entry, and
+	// for every symbol of an object that did not set
+	// MH_SUBSECTIONS_VIA_SYMBOLS, where the whole section is one atom and
+	// only the first symbol lands on its start.
+	bySymbol map[*obj.Symbol]symPos
+}
+
+// symPos is a definition's position: the atom that holds it and the offset
+// from that atom's start.
+type symPos struct {
+	atom *image.Atom
+	off  uint64
 }
 
 // split turns every loaded object into atoms.
@@ -70,7 +82,7 @@ func (l *Linker) split(img *image.Image) error {
 func (l *Linker) splitInput(img *image.Image, in *inputFile) error {
 	st := &splitState{
 		bySection: make(map[*obj.Section][]*image.Atom),
-		bySymbol:  make(map[*obj.Symbol]*image.Atom),
+		bySymbol:  make(map[*obj.Symbol]symPos),
 	}
 	in.split = st
 	ii := l.imageInput(img, in)
@@ -100,27 +112,43 @@ func (l *Linker) splitInput(img *image.Image, in *inputFile) error {
 		if d.input != in || d.sym == nil {
 			continue
 		}
-		a := st.bySymbol[d.sym]
-		if a == nil {
-			// A definition with no atom is an absolute symbol, which has a
-			// value and no storage. Anything else is an object whose symbol
-			// table disagrees with its section contents.
-			if sym.Class == image.ClassAbsolute {
-				continue
+		pos, ok := st.bySymbol[d.sym]
+		if !ok {
+			// The symbol begins no atom. Either it names a position inside
+			// one — which is every symbol but the first when the section was
+			// not cut at symbol boundaries — or it has no storage at all.
+			var err error
+			pos, err = l.positionOf(st, d.sym)
+			if err != nil {
+				// A definition with no atom is an absolute symbol, which has
+				// a value and no storage. Anything else is an object whose
+				// symbol table disagrees with its section contents.
+				if sym.Class == image.ClassAbsolute {
+					continue
+				}
+				return fmt.Errorf("%s: %w", sym.Name, err)
 			}
-			return fmt.Errorf("%s is defined at an address no section covers", sym.Name)
+			st.bySymbol[d.sym] = pos
 		}
-		sym.Atom = a
-		a.Sym = sym
+		sym.Atom, sym.Offset = pos.atom, pos.off
+		// Only the symbol that starts the atom names it. A definition inside
+		// one — an alt entry, or a later symbol of an uncut section — is
+		// carried by that atom but does not own it, and overwriting Sym here
+		// would hand the atom's identity to whichever definition was seen
+		// last.
+		if pos.off == 0 && pos.atom.Sym == nil {
+			pos.atom.Sym = sym
+		}
 		if sym.Root {
-			a.Root = true
+			pos.atom.Root = true
 		}
 	}
 	for d, sym := range l.res.coalesced {
 		if d.input != in || d.sym == nil {
 			continue
 		}
-		if a := st.bySymbol[d.sym]; a != nil {
+		if pos, ok := st.bySymbol[d.sym]; ok {
+			a := pos.atom
 			// Permanent, and independent of dead-stripping: the atom stays
 			// referenceable and references to it are redirected to the
 			// winner, rather than the atom being resurrected.
@@ -129,6 +157,37 @@ func (l *Linker) splitInput(img *image.Image, in *inputFile) error {
 		}
 	}
 	return nil
+}
+
+// positionOf locates a definition that begins no atom.
+//
+// It exists for the object that does not set MH_SUBSECTIONS_VIA_SYMBOLS.
+// There the section is a single atom by definition — the compiler has not
+// promised cuts at symbol boundaries are safe — so only the symbol at offset
+// zero begins one, and every other definition in that section is a position
+// inside it. Such an object is perfectly legal and has to link; the section
+// simply lives or dies as a unit under dead-stripping.
+//
+// The same lookup covers a symbol landing inside a literal or unwind atom,
+// where the cuts are made by content and pay no attention to the symbol
+// table.
+func (l *Linker) positionOf(st *splitState, sym *obj.Symbol) (symPos, error) {
+	sec := sym.Sec
+	if sec == nil {
+		return symPos{}, fmt.Errorf("is defined in no section")
+	}
+	atoms := st.bySection[sec]
+	if len(atoms) == 0 {
+		return symPos{}, fmt.Errorf("is defined in %s, which contributes no atoms", sec)
+	}
+	if sym.Value < sec.Addr {
+		return symPos{}, fmt.Errorf("is defined at 0x%x, before %s", sym.Value, sec)
+	}
+	a, off, err := l.atomAtIndex(atoms, sec, sym.Value-sec.Addr)
+	if err != nil {
+		return symPos{}, fmt.Errorf("is defined at an address no section covers: %w", err)
+	}
+	return symPos{atom: a, off: off}, nil
 }
 
 // splitSection cuts one object section into atoms.
@@ -165,20 +224,28 @@ func (l *Linker) splitBySymbols(in *inputFile, sec *obj.Section) ([]*image.Atom,
 			Root:   p.Root(),
 		}
 		out = append(out, a)
-		if p.Sym != nil {
-			in.split.bySymbol[p.Sym] = a
-		}
-		for _, alias := range p.Aliases {
-			in.split.bySymbol[alias] = a
-		}
-		// An alt-entry symbol names a position inside this atom and does not
-		// begin one of its own, so it maps to the same atom. Anything that
-		// resolves it gets the containing atom plus an offset.
-		for _, alt := range p.Alt {
-			in.split.bySymbol[alt] = a
-		}
+		in.split.record(sec, p, a)
 	}
 	return out, nil
+}
+
+// record maps every symbol an atom carries to its position within it.
+//
+// The atom's own symbol and its aliases sit at offset zero by construction.
+// An alt-entry symbol names a position strictly inside the atom and does not
+// begin one of its own, so it maps to the same atom at the offset its value
+// implies; binding it to the atom's start would put every reference to it at
+// the wrong address.
+func (st *splitState) record(sec *obj.Section, p obj.Atom, a *image.Atom) {
+	if p.Sym != nil {
+		st.bySymbol[p.Sym] = symPos{atom: a}
+	}
+	for _, alias := range p.Aliases {
+		st.bySymbol[alias] = symPos{atom: a}
+	}
+	for _, alt := range p.Alt {
+		st.bySymbol[alt] = symPos{atom: a, off: alt.Value - sec.Addr - p.Offset}
+	}
 }
 
 // splitZerofill produces one atom per symbol with no file bytes.
@@ -202,12 +269,7 @@ func (l *Linker) splitZerofill(in *inputFile, sec *obj.Section) ([]*image.Atom, 
 			Root:   p.Root(),
 		}
 		out = append(out, a)
-		if p.Sym != nil {
-			in.split.bySymbol[p.Sym] = a
-		}
-		for _, alias := range p.Aliases {
-			in.split.bySymbol[alias] = a
-		}
+		in.split.record(sec, p, a)
 	}
 	return out, nil
 }
@@ -521,6 +583,44 @@ func (l *Linker) makeReloc(in *inputFile, sec *obj.Section, atoms []*image.Atom,
 	}
 
 	switch {
+	case r.Sym != nil && !r.Sym.Ext():
+		// An extern relocation naming a symbol with internal linkage is a
+		// reference within this object, not a name for resolution to find:
+		// the symbol is in the object's table so the assembler could point
+		// at it, but it is in no other file's, and interning it would make
+		// the link fail on an undefined symbol that is defined right here.
+		// clang emits exactly this for a string literal — an l_.str label
+		// referenced by a PAGE21/PAGEOFF12 pair — so it is the ordinary
+		// case, not a corner.
+		//
+		// Two objects may each have a local of the same name, which is the
+		// other reason the global table is the wrong place for it: the
+		// reference has to reach this object's definition and no other.
+		pos, ok := in.split.bySymbol[r.Sym]
+		if !ok {
+			p, err := l.positionOf(in.split, r.Sym)
+			if err != nil {
+				return ir, fmt.Errorf("%s: relocation at 0x%x names %s, which %w",
+					sec, r.Address, r.Sym.Name, err)
+			}
+			pos = p
+			in.split.bySymbol[r.Sym] = pos
+		}
+		ir.Atom = pos.atom
+		ir.Addend = addend + int64(pos.off)
+		if addend == 0 {
+			// The addend still has to come out of the instruction stream for
+			// the kinds that carry it there; becoming an atom reference does
+			// not move it. The tail of this function does the same for a
+			// symbol reference and skips anything already bound to an atom.
+			if data, err := sec.Data(); err == nil {
+				probe := ir
+				probe.Atom = nil
+				if a, ok := l.be.Addend(data, uint64(r.Address), probe); ok {
+					ir.Addend += a
+				}
+			}
+		}
 	case r.Sym != nil:
 		ir.Sym = table.Intern(r.Sym.Name)
 	case r.Sec != nil:
