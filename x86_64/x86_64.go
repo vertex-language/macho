@@ -188,7 +188,7 @@ func (b *Backend) Scan(img *image.Image, reqs *backend.Reqs) error {
 	for _, sec := range img.Sections() {
 		for _, atom := range sec.LiveAtoms() {
 			for _, r := range atom.Relocs {
-				if err := b.scanReloc(atom, r, reqs); err != nil {
+				if err := b.scanReloc(img, atom, r, reqs); err != nil {
 					return err
 				}
 			}
@@ -197,7 +197,7 @@ func (b *Backend) Scan(img *image.Image, reqs *backend.Reqs) error {
 	return nil
 }
 
-func (b *Backend) scanReloc(atom *image.Atom, r image.Reloc, reqs *backend.Reqs) error {
+func (b *Backend) scanReloc(img *image.Image, atom *image.Atom, r image.Reloc, reqs *backend.Reqs) error {
 	kind := b.Classify(r.Type)
 	if kind == backend.KindUnknown {
 		return fmt.Errorf("%w: r_type %d at %s+0x%x",
@@ -235,6 +235,14 @@ func (b *Backend) scanReloc(atom *image.Atom, r image.Reloc, reqs *backend.Reqs)
 	// A difference between two addresses in this image is a link-time
 	// constant: it does not slide, so it is neither a rebase nor a bind.
 	if r.Sub != nil {
+		return nil
+	}
+
+	// Nor does a thread-local descriptor's offset field, which is a
+	// distance from the start of the template region rather than an
+	// address. Registering a rebase for it would have dyld slide a
+	// number that is then added to the thread's block base.
+	if backend.IsTLVTemplateRef(atom, r) {
 		return nil
 	}
 	if r.Length != macho.RelocQuad {
@@ -330,6 +338,28 @@ func (b *Backend) value(s *backend.Site, r image.Reloc, kind backend.Kind) (uint
 			return 0, fmt.Errorf("x86_64: the image has no %s section", b.stub.Name)
 		}
 		return b.stub.Entry(base, i), nil
+	}
+
+	// A pointer to an import has no address in this image. Scan
+	// registered a bind for it, so dyld is what writes the address at
+	// load — and the chained-fixup encoder overwrites this field with a
+	// chain entry before that. What goes here now is the addend the bind
+	// carries, because resolving a target that does not exist is the
+	// alternative, and it fails.
+	//
+	// The condition mirrors Scan's exactly. The two have to agree: a
+	// site Scan registered and this resolved would be written twice with
+	// different answers, and one Scan skipped and this resolved would
+	// ask an unbound symbol for its address.
+	if kind.IsPointer() && r.Sub == nil && r.Sym != nil && !r.Sym.Defined() {
+		return uint64(r.Addend), nil
+	}
+
+	// A thread-local descriptor's offset field holds the template's
+	// distance from the region base, which is a link-time constant and
+	// not the address the relocation appears to name.
+	if off, ok := backend.TLVTemplateOffset(s.Img, s.Atom, r); ok {
+		return off, nil
 	}
 
 	v, err := r.Target()

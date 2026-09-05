@@ -86,6 +86,32 @@ func (t SecType) Zerofill() bool {
 	return false
 }
 
+// HoldsPointers reports whether a section of type t is an array of
+// pointers, whatever alignment its inputs declared.
+//
+// It matters because the declared alignment can be less. clang emits
+// __thread_vars with align 1, and the section is three pointers per
+// thread-local: a descriptor placed on an odd boundary is read by a
+// pointer-width load at the use site, and the answer is whatever
+// straddles it. Apple's linker raises the section to pointer alignment
+// rather than trusting the input, and so does this one.
+//
+// S_THREAD_LOCAL_VARIABLES is the descriptor array. The others are the
+// pointer tables the indirect symbol table indexes, which are pointers
+// by definition.
+func (t SecType) HoldsPointers() bool {
+	switch t {
+	case S_THREAD_LOCAL_VARIABLES,
+		S_NON_LAZY_SYMBOL_POINTERS, S_LAZY_SYMBOL_POINTERS,
+		S_LAZY_DYLIB_SYMBOL_POINTERS,
+		S_THREAD_LOCAL_VARIABLE_POINTERS,
+		S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
+		S_MOD_INIT_FUNC_POINTERS, S_MOD_TERM_FUNC_POINTERS:
+		return true
+	}
+	return false
+}
+
 // Indirect reports whether a section of type t has entries in the indirect
 // symbol table, indexed from the section's reserved1 field.
 func (t SecType) Indirect() bool {

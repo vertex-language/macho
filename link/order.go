@@ -258,11 +258,25 @@ func (g *gotSynthetic) Generate(img *image.Image) error {
 	return g.src.Set(buf)
 }
 
-// tlvSynthetic is __DATA,__thread_ptrs: one descriptor pointer per
-// thread-local symbol, written by the runtime rather than by the linker.
+// tlvSynthetic is __DATA,__thread_ptrs: one pointer per thread-local
+// symbol, and each points at that variable's descriptor.
+//
+// The runtime writes the descriptor — the key and the offset dyld fills
+// in, and the thunk it swaps once the block exists. It does not write
+// this table. What goes here is the descriptor's own address, which is
+// the linker's to supply and slides with the image like any other
+// pointer, so every slot is a rebase or a bind exactly as a GOT slot is.
+//
+// Leaving them zero is what a TLV access then reads: the sequence loads
+// the descriptor pointer from here, loads the thunk from the descriptor,
+// and calls it. A zero slot makes that a call through a null pointer,
+// which is a crash inside the program's first use of a thread-local and
+// nowhere near the cause.
 type tlvSynthetic struct {
-	l   *Linker
-	src *image.RawSource
+	l    *Linker
+	sec  *image.Section
+	src  *image.RawSource
+	atom *image.Atom
 }
 
 func (t *tlvSynthetic) SyntheticName() string { return "__DATA,__thread_ptrs" }
@@ -280,13 +294,59 @@ func (t *tlvSynthetic) Prepare(img *image.Image) error {
 	if err != nil {
 		return err
 	}
+	t.sec = sec
 	t.src = image.NewRawSource(uint64(n) * uint64(word))
-	return t.l.addSynthetic(sec, &image.Atom{
-		Name: "<thread_ptrs>", Source: t.src, Align: word,
-	})
+	t.atom = &image.Atom{Name: "<thread_ptrs>", Source: t.src, Align: word}
+	if err := t.l.addSynthetic(sec, t.atom); err != nil {
+		return err
+	}
+
+	// The same rule the GOT follows, and for the same reason: a slot
+	// naming something in this image still has to slide, and one naming
+	// an import is dyld's to write.
+	for i, sym := range t.l.reqs.TLVSyms() {
+		off := uint64(i) * uint64(word)
+		if sym.Defined() {
+			if err := t.l.reqs.AddRebase(backend.Rebase{Atom: t.atom, Offset: off}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := t.l.reqs.AddBind(backend.Bind{
+			Atom: t.atom, Offset: off, Sym: sym, Weak: sym.WeakRef,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (t *tlvSynthetic) Generate(img *image.Image) error { return nil }
+func (t *tlvSynthetic) Generate(img *image.Image) error {
+	if t.sec == nil {
+		return nil
+	}
+	st, ok := backend.AsStubber(t.l.be)
+	if !ok {
+		return fmt.Errorf("link: this backend cannot write a pointer slot")
+	}
+	word := t.l.be.WordSize()
+	buf := make([]byte, len(t.l.reqs.TLVSyms())*word)
+	for i, sym := range t.l.reqs.TLVSyms() {
+		// An import's slot is left zero, as the GOT's is: dyld writes it,
+		// and a plausible address here would be indistinguishable from a
+		// bound one if the fixup that should overwrite it went missing.
+		var target uint64
+		if sym.Bound {
+			target = sym.Value
+		}
+		// A descriptor pointer is a pointer: the same width, the same
+		// byte order, and the same writer the GOT's slots use.
+		if err := st.WriteGotSlot(buf[i*word:(i+1)*word], target); err != nil {
+			return err
+		}
+	}
+	return t.src.Set(buf)
+}
 
 // stubSynthetic is __TEXT,__stubs and, when the strategy is lazy, the
 // __DATA,__la_symbol_ptr table and the __TEXT,__stub_helper it initially

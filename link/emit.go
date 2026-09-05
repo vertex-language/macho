@@ -35,7 +35,7 @@ func (l *Linker) emit(img *image.Image) error {
 		FileType:   l.opts.Output.FileType(),
 		NCmds:      ncmds,
 		SizeOfCmds: uint32(cmdSize),
-		Flags:      l.headerFlags(),
+		Flags:      l.headerFlags(img),
 	}
 	h.Encode(b)
 

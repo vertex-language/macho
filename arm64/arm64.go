@@ -235,7 +235,7 @@ func (b *Backend) Scan(img *image.Image, reqs *backend.Reqs) error {
 	for _, sec := range img.Sections() {
 		for _, atom := range sec.LiveAtoms() {
 			for _, r := range atom.Relocs {
-				if err := b.scanReloc(atom, r, reqs); err != nil {
+				if err := b.scanReloc(img, atom, r, reqs); err != nil {
 					return err
 				}
 			}
@@ -244,7 +244,7 @@ func (b *Backend) Scan(img *image.Image, reqs *backend.Reqs) error {
 	return nil
 }
 
-func (b *Backend) scanReloc(atom *image.Atom, r image.Reloc, reqs *backend.Reqs) error {
+func (b *Backend) scanReloc(img *image.Image, atom *image.Atom, r image.Reloc, reqs *backend.Reqs) error {
 	kind := b.Classify(r.Type)
 	switch kind {
 	case backend.KindUnknown:
@@ -268,8 +268,23 @@ func (b *Backend) scanReloc(atom *image.Atom, r image.Reloc, reqs *backend.Reqs)
 		return nil
 	}
 	if kind.NeedsTLV() {
+		// Only an imported thread-local needs a pointer slot. One
+		// defined here has a descriptor at a known address, so the
+		// ADRP/LDR pair is relaxed into ADRP/ADD and addresses it
+		// directly — which is what Apple's linker emits, and why a
+		// program with thread-locals of its own has no __thread_ptrs
+		// section at all.
+		//
+		// A relocation naming an atom rather than a symbol is one of
+		// those: a reference to a local becomes an atom reference when
+		// the objects are merged, and a `static _Thread_local` is
+		// local. It names nothing that could be imported.
+		if tlvIsLocal(r) {
+			return nil
+		}
 		if r.Sym == nil {
-			return fmt.Errorf("arm64: TLV relocation at %s+0x%x names no symbol", atom, r.Offset)
+			return fmt.Errorf("arm64: TLV relocation at %s+0x%x names neither a symbol nor an atom",
+				atom, r.Offset)
 		}
 		reqs.TLV(r.Sym)
 		return nil
@@ -291,6 +306,14 @@ func (b *Backend) scanReloc(atom *image.Atom, r image.Reloc, reqs *backend.Reqs)
 	// A difference between two addresses in this image is a link-time
 	// constant. It does not slide, so it is neither a rebase nor a bind.
 	if r.Sub != nil {
+		return nil
+	}
+
+	// Nor does a thread-local descriptor's offset field, which is a
+	// distance from the start of the template region rather than an
+	// address. Registering a rebase for it would have dyld slide a
+	// number that is then added to the thread's block base.
+	if backend.IsTLVTemplateRef(atom, r) {
 		return nil
 	}
 	if int(r.Length.Bytes()) != b.cfg.WordSize {
@@ -355,6 +378,22 @@ func (b *Backend) Apply(s *backend.Site, r image.Reloc) error {
 		// PAGE21 and PAGEOFF12 share a Kind with their GOT and TLV variants,
 		// so the r_type decides which half this is.
 		if isPageOff(r.Type) {
+			// The low half of a TLV pair whose descriptor is in this
+			// image loads nothing: value is the descriptor's own
+			// address, so the LDR becomes an ADD of it. Leaving the LDR
+			// would dereference the descriptor and call whatever its
+			// first word happens to hold.
+			if kind == backend.KindTLV && tlvIsLocal(r) {
+				add, err := relaxGotLoadToAdd(base)
+				if err != nil {
+					return b.decorate(s, r, err, pc)
+				}
+				insn, err := encodePageOff12(add, value)
+				if err != nil {
+					return b.decorate(s, r, err, pc)
+				}
+				return s.Write32(r.Offset, insn)
+			}
 			insn, err := encodePageOff12(base, value)
 			if err != nil {
 				return b.decorate(s, r, err, pc)
@@ -405,6 +444,10 @@ func (b *Backend) value(s *backend.Site, r image.Reloc, kind backend.Kind) (uint
 	case kind.NeedsGOT():
 		return b.slotAddr(s, r.Sym, b.got.Name, b.got.EntrySize, s.Reqs.GOTIndex, "GOT")
 	case kind.NeedsTLV():
+		// A descriptor defined here is addressed directly; see Scan.
+		if tlvIsLocal(r) {
+			return r.Target()
+		}
 		return b.slotAddr(s, r.Sym, macho.Sec(macho.SEG_DATA, macho.SECT_THREAD_PTRS),
 			uint32(b.cfg.WordSize), s.Reqs.TLVIndex, "thread-local")
 	}
@@ -421,6 +464,28 @@ func (b *Backend) value(s *backend.Site, r image.Reloc, kind backend.Kind) (uint
 			return 0, fmt.Errorf("arm64: the image has no %s section", b.stub.Name)
 		}
 		return b.stub.Entry(base, i), nil
+	}
+
+	// A thread-local descriptor's offset field holds the template's
+	// distance from the region base, which is a link-time constant and
+	// not the address the relocation appears to name.
+	if off, ok := backend.TLVTemplateOffset(s.Img, s.Atom, r); ok {
+		return off, nil
+	}
+
+	// A pointer to an import has no address in this image. Scan
+	// registered a bind for it, so dyld is what writes the address at
+	// load — and the chained-fixup encoder overwrites this field with a
+	// chain entry before that. What goes here now is the addend the bind
+	// carries, because resolving a target that does not exist is the
+	// alternative, and it fails.
+	//
+	// The condition mirrors Scan's exactly. The two have to agree: a
+	// site Scan registered and this resolved would be written twice with
+	// different answers, and one Scan skipped and this resolved would
+	// ask an unbound symbol for its address.
+	if kind.IsPointer() && r.Sub == nil && r.Sym != nil && !r.Sym.Defined() {
+		return uint64(r.Addend), nil
 	}
 
 	v, err := r.Target()
@@ -477,6 +542,20 @@ func (b *Backend) rangeErr(s *backend.Site, r image.Reloc, v int64, bits, shift 
 	return b.decorate(s, r, &backend.RangeError{
 		Value: v, Bits: bits, Signed: true, Shift: shift,
 	}, pc)
+}
+
+// tlvIsLocal reports whether a thread-local relocation names a
+// descriptor in this image, which is the case that needs no pointer slot
+// and gets the ADRP/ADD form.
+//
+// An atom reference is always one: merging turns a reference to a local
+// symbol into a reference to the atom that defines it, and nothing
+// outside the image has an atom here.
+func tlvIsLocal(r image.Reloc) bool {
+	if r.Atom != nil {
+		return true
+	}
+	return r.Sym != nil && r.Sym.Defined()
 }
 
 // isPageOff reports whether an r_type is the low-bits half of a two-instruction

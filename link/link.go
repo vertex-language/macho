@@ -249,7 +249,7 @@ func (l *Linker) Link() (*image.Image, error) {
 	img := image.New(l.target)
 	if err := img.SetOptions(image.Options{
 		FileType:     l.opts.Output.FileType(),
-		Flags:        l.headerFlags(),
+		Flags:        l.headerFlags(nil),
 		PageSize:     l.opts.PageSize,
 		PageZeroSize: l.opts.PageZeroSize,
 		NoPageZero:   !l.opts.hasPageZero(),
@@ -310,7 +310,12 @@ func (l *Linker) Link() (*image.Image, error) {
 }
 
 // headerFlags computes the header flags for the output.
-func (l *Linker) headerFlags() macho.Flags {
+//
+// img is the laid-out image, or nil before there is one. The flags that
+// depend on what the image turned out to contain are added only when it
+// is there, which is why emit calls this again rather than reusing the
+// value SetOptions was given.
+func (l *Linker) headerFlags(img *image.Image) macho.Flags {
 	f := l.opts.Flags | macho.MH_DYLDLINK | macho.MH_NOUNDEFS
 	if l.opts.Namespace == NamespaceTwoLevel {
 		f |= macho.MH_TWOLEVEL
@@ -326,7 +331,31 @@ func (l *Linker) headerFlags() macho.Flags {
 		// there are none would be a lie dyld acts on.
 		f &^= macho.MH_NOUNDEFS
 	}
+	if hasTLVDescriptors(img) {
+		// dyld reads this flag to decide whether the image needs a
+		// thread-local block set up at all. Without it the descriptors
+		// are bytes nobody initializes: the thunk in each one stays as
+		// the linker left it, and the first read of a thread-local calls
+		// through it.
+		f |= macho.MH_HAS_TLV_DESCRIPTORS
+	}
 	return f
+}
+
+// hasTLVDescriptors reports whether the image declares any thread-local
+// variable.
+func hasTLVDescriptors(img *image.Image) bool {
+	if img == nil {
+		return false
+	}
+	for _, seg := range img.Segments() {
+		for _, sec := range seg.Sections() {
+			if sec.Key.Type == macho.S_THREAD_LOCAL_VARIABLES {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // scan is the backend's sizing pass. It is a one-liner and is here rather than

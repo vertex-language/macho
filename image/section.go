@@ -71,7 +71,22 @@ func (img *Image) Section(key SectionKey) (*Section, error) {
 	if err != nil {
 		return nil, err
 	}
-	sec := &Section{Key: key, Align: 1, seg: seg, img: img}
+	// A section that is an array of pointers starts pointer-aligned,
+	// whatever its inputs declare. clang emits __thread_vars with align
+	// 1, and a descriptor on an odd boundary is read by a pointer-width
+	// load that returns whatever straddles it.
+	//
+	// It is set here, once, rather than while placing sections: layout
+	// runs more than once when relaxation changes a size, and a section
+	// that grows its alignment on each pass moves everything after it
+	// between passes.
+	align := uint32(1)
+	if key.Type.HoldsPointers() {
+		if w := uint32(img.target.Width().Bits() / 8); w > align {
+			align = w
+		}
+	}
+	sec := &Section{Key: key, Align: align, seg: seg, img: img}
 	seg.sections = append(seg.sections, sec)
 	img.sections = append(img.sections, sec)
 	img.secByKey[key] = sec
