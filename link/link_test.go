@@ -184,11 +184,20 @@ func TestAddRPathRejectsDuplicate(t *testing.T) {
 
 // realLibSystemTBD returns a real libSystem.tbd from the toolchain, or "" if
 // none of the known SDK layouts are present on this machine.
-func realLibSystemTBD() string {
-	candidates := []string{
-		"/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libSystem.tbd",
+func realLibSystemTBD() string { return realSDKStub("libSystem.tbd") }
+
+// realObjCTBD is libobjc's stub, which is where an Objective-C image's
+// __objc_empty_cache and objc_msgSend come from. libSystem does not
+// re-export it.
+func realObjCTBD() string { return realSDKStub("libobjc.A.tbd") }
+
+func realSDKStub(name string) string {
+	roots := []string{
+		"/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+		"/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
 	}
-	for _, c := range candidates {
+	for _, r := range roots {
+		c := filepath.Join(r, "usr/lib", name)
 		if _, err := os.Stat(c); err == nil {
 			return c
 		}
@@ -370,5 +379,116 @@ int main(int argc, char **argv) {
 	}
 	if out, err := exec.Command(harness, dylibPath).CombinedOutput(); err != nil {
 		t.Fatalf("dlopen/dlsym harness failed: %v\n%s", err, out)
+	}
+}
+
+// A literal pointer table is not deduplicated by content.
+//
+// An S_LITERAL_POINTERS section holds addresses, and in an object file every
+// entry is eight zero bytes plus a relocation — so by content they are all
+// the same literal. Folding them collapses the table onto its first entry.
+//
+// __objc_selrefs is exactly that section, and this is what a program whose
+// selector references merged does: it sends the first selector everywhere the
+// second was written, and aborts on an unrecognized selector at the first
+// message. The Objective-C compiler that found it is the reason this test is
+// written against clang's own output rather than a synthetic object.
+func TestLiteralPointersAreNotMerged(t *testing.T) {
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skip("clang not found on PATH")
+	}
+	tbdPath := realLibSystemTBD()
+	if tbdPath == "" {
+		t.Skip("no known libSystem.tbd found on this machine")
+	}
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "t.m")
+	objPath := filepath.Join(dir, "t.o")
+	if err := os.WriteFile(src, []byte(`
+@interface NSObject
+@end
+@interface K : NSObject
+- (int)one;
+- (int)two;
+@end
+@implementation K
+- (int)one { return 1; }
+- (int)two { return 2; }
+@end
+int f(K *k) { return [k one] + [k two]; }
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// Classic selector references rather than clang's newer selector
+	// stubs, which is the shape this test is about — and the shape every
+	// other Objective-C compiler emits.
+	cmd := exec.Command(clang, "-c", "-x", "objective-c",
+		"-fno-objc-msgsend-selector-stubs",
+		"-target", "arm64-apple-macos14.0", "-O0", "-o", objPath, src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("clang could not build the object: %v\n%s", err, out)
+	}
+
+	target, err := macho.ParseTarget("arm64-apple-macos14.0")
+	if err != nil {
+		t.Fatalf("ParseTarget: %v", err)
+	}
+	l, err := link.New(target)
+	if err != nil {
+		t.Fatalf("link.New: %v", err)
+	}
+	defer l.Close()
+
+	objData, err := os.ReadFile(objPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if err := l.AddObject("t.o", objData); err != nil {
+		t.Fatalf("AddObject: %v", err)
+	}
+	tbdData, err := os.ReadFile(tbdPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", tbdPath, err)
+	}
+	if err := l.AddStub("libSystem", tbdData); err != nil {
+		t.Fatalf("AddStub: %v", err)
+	}
+	objcPath := realObjCTBD()
+	if objcPath == "" {
+		t.Skip("no libobjc.A.tbd on this machine")
+	}
+	objcData, err := os.ReadFile(objcPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", objcPath, err)
+	}
+	if err := l.AddStub("libobjc", objcData); err != nil {
+		t.Fatalf("AddStub(libobjc): %v", err)
+	}
+	l.Options().Output = link.OutputDylib
+	l.SetInstallName("@rpath/t.dylib")
+
+	img, err := l.Link()
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if _, err := img.Bytes(); err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+
+	// Two selectors were referenced, so the table has to hold two entries.
+	// One means they merged.
+	var size uint64
+	for _, sec := range img.Sections() {
+		if sec.Key.Name.Section == "__objc_selrefs" {
+			size = sec.Size
+		}
+	}
+	if size == 0 {
+		t.Skip("this clang emitted no __objc_selrefs")
+	}
+	if size != 16 {
+		t.Errorf("__objc_selrefs is %d bytes, want 16 — two selectors, two entries", size)
 	}
 }

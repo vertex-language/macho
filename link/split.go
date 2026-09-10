@@ -317,10 +317,9 @@ func (l *Linker) splitLiterals(in *inputFile, sec *obj.Section) ([]*image.Atom, 
 	off := uint64(0)
 	for _, s := range spans {
 		out = append(out, &image.Atom{
-			Source: &image.Fragment{Data: s, Align: sec.Align},
+			Source: &image.Fragment{Data: s, Align: sec.Align, Off: off},
 			Align:  sec.Align,
 		})
-		_ = off
 		off += uint64(len(s))
 	}
 	return out, nil
@@ -706,9 +705,18 @@ func (l *Linker) atomAtIndex(atoms []*image.Atom, sec *obj.Section, off uint64) 
 }
 
 // atomOffset is an atom's offset within the object section it came from.
+//
+// A literal atom has one too. Without it every literal in a section claims to
+// start at zero, so the binary search below always lands on the first — and a
+// symbol or relocation pointing anywhere past it resolves to nothing. Every
+// Objective-C image is that case: each selector name in __objc_methname
+// carries a label, and each is a separate literal.
 func atomOffset(a *image.Atom) uint64 {
-	if s, ok := a.Source.(*objSource); ok {
+	switch s := a.Source.(type) {
+	case *objSource:
 		return s.off
+	case *image.Fragment:
+		return s.Off
 	}
 	return 0
 }

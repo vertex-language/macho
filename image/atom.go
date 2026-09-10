@@ -161,10 +161,24 @@ func (a *Atom) String() string {
 type Fragment struct {
 	Data  []byte
 	Align uint32
+
+	// Off is where this literal sat in the object section it was cut from.
+	//
+	// It exists so that a symbol or a relocation pointing into the middle of
+	// a literal section can be resolved to the literal that covers it: the
+	// section is one run of bytes in the object and many atoms afterwards,
+	// and without the offset every one of them claims to start at zero. A
+	// cstring section with a label on each string — which is every
+	// Objective-C image, where each selector name carries one — resolves
+	// nothing past the first.
+	//
+	// It takes no part in deduplication: a literal's identity is its
+	// content, and two copies at different offsets are the same literal.
+	Off uint64
 }
 
-func (f *Fragment) Size() uint64          { return uint64(len(f.Data)) }
-func (f *Fragment) Zerofill() bool        { return false }
+func (f *Fragment) Size() uint64           { return uint64(len(f.Data)) }
+func (f *Fragment) Zerofill() bool         { return false }
 func (f *Fragment) Bytes() ([]byte, error) { return f.Data, nil }
 
 // Reloc is one relocation to apply to an atom.

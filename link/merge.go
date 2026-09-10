@@ -60,13 +60,29 @@ type literalKey struct {
 //
 // Taking the maximum over every copy is therefore not conservatism, it is the
 // only correct choice available given what the format records.
+//
+// # A literal with a relocation is not a literal
+//
+// A fragment's identity is its bytes, which is only the whole of it when the
+// bytes are the whole of the literal. An S_LITERAL_POINTERS section holds a
+// table of *addresses*, and every entry in an object file is eight zero bytes
+// plus a relocation — so by content they are all the same literal, and
+// folding them collapses the table onto its first entry.
+//
+// __objc_selrefs is exactly that section. Each entry names one selector, the
+// runtime rewrites each in place, and a program whose two selector references
+// merged sends the first selector everywhere the second was written: an
+// -[NSObject alloc] on an object that was asked for something else entirely.
+//
+// So an atom carrying relocations is left alone. Its identity is what it
+// points at, and that is not known until the addresses are.
 func (l *Linker) mergeLiterals() error {
 	first := make(map[literalKey]*image.Atom)
 	survivors := make([]*image.Atom, 0, len(l.atoms))
 
 	for _, a := range l.atoms {
 		frag, ok := a.Source.(*image.Fragment)
-		if !ok || !a.Live {
+		if !ok || !a.Live || len(a.Relocs) > 0 {
 			survivors = append(survivors, a)
 			continue
 		}
@@ -154,8 +170,8 @@ func (l *Linker) sectionOf(a *image.Atom) image.SectionKey {
 	// An atom whose section was never recorded is linker-generated; put it in
 	// __TEXT,__text, which is where a synthetic with no opinion belongs.
 	return image.SectionKey{
-		Name: macho.Sec(macho.SEG_TEXT, macho.SECT_TEXT),
-		Type: macho.S_REGULAR,
+		Name:  macho.Sec(macho.SEG_TEXT, macho.SECT_TEXT),
+		Type:  macho.S_REGULAR,
 		Attrs: macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS,
 	}
 }
