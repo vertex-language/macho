@@ -623,10 +623,24 @@ func (l *Linker) makeReloc(in *inputFile, sec *obj.Section, atoms []*image.Atom,
 	case r.Sym != nil:
 		ir.Sym = table.Intern(r.Sym.Name)
 	case r.Sec != nil:
-		// A section-relative reference names an address, not a symbol. Which
-		// atom it lands in depends on where the split fell, so it is resolved
-		// to an atom here and the residual offset becomes part of the addend.
-		a, delta, err := l.atomAt(in, r.Sec, uint64(r.Address)+uint64(addend))
+		// A section-relative reference names an address, not a symbol, and
+		// the address is in the field rather than in the entry: Mach-O
+		// writes the target's own address into the bytes and the relocation
+		// says only which section that address is in. clang's compact unwind
+		// records are written this way -- the function, the personality and
+		// the LSDA are all section references, because none of the three has
+		// to have a symbol on it.
+		//
+		// Which atom the address lands in depends on where the split fell,
+		// so it is resolved here and the residual offset becomes part of the
+		// addend.
+		addr := uint64(addend)
+		if data, err := sec.Data(); err == nil {
+			if a, ok := l.be.Addend(data, uint64(r.Address), ir); ok {
+				addr += uint64(a)
+			}
+		}
+		a, delta, err := l.atomAt(in, r.Sec, addr)
 		if err != nil {
 			return ir, fmt.Errorf("%s at 0x%x: %w", sec, r.Address, err)
 		}

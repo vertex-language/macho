@@ -170,11 +170,11 @@ func (l *Linker) decodeCompactUnwind(a *image.Atom) (cuEntry, bool, error) {
 	for _, r := range a.Relocs {
 		switch r.Offset {
 		case cuFunctionOffset:
-			e.fn, e.fnOff = l.survivor(r.Atom), uint64(r.Addend)
+			e.fn, e.fnOff = l.referent(r), uint64(r.Addend)
 		case cuPersonalityOffset:
 			e.personality = r.Sym
 		case cuLSDAOffset:
-			e.lsda, e.lsdaOff = l.survivor(r.Atom), uint64(r.Addend)
+			e.lsda, e.lsdaOff = l.referent(r), uint64(r.Addend)
 		}
 	}
 	if e.fn == nil || !e.fn.Live || e.fn.Coalesced {
@@ -184,6 +184,24 @@ func (l *Linker) decodeCompactUnwind(a *image.Atom) (cuEntry, bool, error) {
 		return cuEntry{}, false, nil
 	}
 	return e, true, nil
+}
+
+// referent is the atom a record's function or LSDA relocation names.
+//
+// Two spellings reach here and both are ordinary. clang names the function
+// with a section-relative relocation, which split() has already bound to the
+// atom covering that address. An assembler with no way to spell "the address
+// of section N" names the symbol instead, and a symbol with external linkage
+// arrives interned rather than bound — so the atom is the one defining it.
+func (l *Linker) referent(r image.Reloc) *image.Atom {
+	a := r.Atom
+	if a == nil {
+		a = l.definingAtom(r.Sym)
+	}
+	if a == nil {
+		return nil
+	}
+	return l.survivor(a)
 }
 
 // survivor follows a folded atom to the copy that was kept.
