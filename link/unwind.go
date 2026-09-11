@@ -276,6 +276,7 @@ func (u *unwindSynthetic) Generate(img *image.Image) error {
 		fn, lsda uint64
 		hasLSDA  bool
 		enc      uint32
+		length   uint32
 	}
 	entries := make([]resolved, 0, len(u.l.cu))
 	for _, e := range u.l.cu {
@@ -283,7 +284,7 @@ func (u *unwindSynthetic) Generate(img *image.Image) error {
 		if err != nil {
 			return err
 		}
-		r := resolved{fn: fn + e.fnOff - base, enc: e.enc}
+		r := resolved{fn: fn + e.fnOff - base, enc: e.enc, length: e.length}
 		if p := u.personalityIndex(e.personality); p != 0 {
 			r.enc = (r.enc &^ unwindPersonalityMask) | uint32(p)<<unwindPersonalityShift
 		}
@@ -365,21 +366,17 @@ func (u *unwindSynthetic) Generate(img *image.Image) error {
 	// The sentinel. Its function offset is one past the last function, which
 	// is the only thing that says how many bytes the last real entry covers —
 	// without it a lookup past the end of the last function succeeds.
+	//
+	// The last entry by address, not the last one the input happened to
+	// list: the table above is sorted and this has to agree with it, or the
+	// sentinel lands inside a function and everything past it is invisible.
 	last := entries[len(entries)-1]
 	sent := indexOff + uint32(pages)*unwindIndexEntrySize
-	put(sent, uint32(last.fn+uint64(u.lastLength())))
+	put(sent, uint32(last.fn+uint64(last.length)))
 	put(sent+4, 0)
 	put(sent+8, li)
 
 	return u.src.Set(buf)
-}
-
-func (u *unwindSynthetic) lastLength() uint32 {
-	var end uint32
-	for _, e := range u.l.cu {
-		end = e.length
-	}
-	return end
 }
 
 // personalityIndex returns the 1-based index the encoding carries, or 0 for no
