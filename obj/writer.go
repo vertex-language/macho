@@ -207,6 +207,20 @@ const (
 
 // Section creates a section. Duplicate (segment, section) identities are
 // rejected: they are the same section, and Mach-O has no way to express two.
+// RaiseAlign raises the section's alignment to align bytes where that is
+// stricter than what it declared. A section that more than one object
+// section is folded into is aligned to the strictest of them: ld64 reads
+// an atom's alignment as at most its section's, and an atom that needs
+// eight bytes in a section that says four is laid out unaligned.
+func (b *SectionBuilder) RaiseAlign(align uint32) {
+	if align == 0 || align&(align-1) != 0 || align > 1<<maxAlignLog2 {
+		return
+	}
+	if log := uint32(bits.TrailingZeros32(align)); log > b.alignLog {
+		b.alignLog = log
+	}
+}
+
 func (w *Writer) Section(hdr SectionHeader) *SectionBuilder {
 	if !w.live() {
 		return &SectionBuilder{w: w, hdr: hdr}

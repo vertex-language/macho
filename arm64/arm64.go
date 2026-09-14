@@ -358,6 +358,20 @@ func (b *Backend) Apply(s *backend.Site, r image.Reloc) error {
 
 	switch kind {
 	case backend.KindAbsolute, backend.KindAuthPtr:
+		// A four-byte UNSIGNED is a field, not a pointer: the second half
+		// of a SUBTRACTOR pair, whose difference is a relative pointer
+		// into the same image. Writing it as a pointer puts eight bytes
+		// where there are four.
+		if r.Length == macho.RelocLong {
+			if r.Sub != nil {
+				if d := int64(value); d < -1<<31 || d >= 1<<31 {
+					return b.rangeErr(s, r, d, 32, 0, pc)
+				}
+			} else if value > 0xffffffff {
+				return b.rangeErr(s, r, int64(value), 32, 0, pc)
+			}
+			return s.Write32(r.Offset, uint32(value))
+		}
 		// An authenticated pointer's on-disk value is the unsigned target;
 		// the key and discriminator travel in the chained-fixup entry, which
 		// the fixup encoder writes. Nothing extra happens here.
