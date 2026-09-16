@@ -308,7 +308,8 @@ func (l *Linker) growThunks(img *image.Image) (bool, error) {
 				// the addend matters: it was folded into the target address
 				// the thunk materializes, and applying it twice would land
 				// past the function.
-				r.Atom, r.Sym, r.Sub, r.Addend = t, nil, nil, 0
+				r.Atom, r.Sym, r.Addend = t, nil, 0
+				r.Sub, r.SubAtom, r.SubAddend = nil, nil, 0
 				changed = true
 			}
 		}

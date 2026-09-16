@@ -119,6 +119,9 @@ func (l *Linker) referents(r image.Reloc) []*image.Atom {
 	if r.Sub != nil {
 		out = append(out, l.definingAtom(r.Sub))
 	}
+	if r.SubAtom != nil {
+		out = append(out, r.SubAtom)
+	}
 	return out
 }
 

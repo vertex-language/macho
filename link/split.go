@@ -655,7 +655,29 @@ func (l *Linker) makeReloc(in *inputFile, sec *obj.Section, atoms []*image.Atom,
 		if sub.Sym == nil {
 			return ir, fmt.Errorf("%s: SUBTRACTOR at 0x%x does not name a symbol", sec, sub.Address)
 		}
-		ir.Sub = table.Intern(sub.Sym.Name)
+		// A subtrahend with internal linkage is a reference within this
+		// object, for the same reason the other side of the difference
+		// is: the name is in no other file's table, and interning it
+		// would make the link fail on a symbol defined right here. A
+		// relative pointer whose field sits in a local descriptor --
+		// the record beside a private async function, say -- is exactly
+		// this, and it is the ordinary case rather than a corner.
+		if !sub.Sym.Ext() {
+			pos, ok := in.split.bySymbol[sub.Sym]
+			if !ok {
+				p, err := l.positionOf(in.split, sub.Sym)
+				if err != nil {
+					return ir, fmt.Errorf("%s: SUBTRACTOR at 0x%x names %s, which %w",
+						sec, sub.Address, sub.Sym.Name, err)
+				}
+				pos = p
+				in.split.bySymbol[sub.Sym] = pos
+			}
+			ir.SubAtom = pos.atom
+			ir.SubAddend = int64(pos.off)
+		} else {
+			ir.Sub = table.Intern(sub.Sym.Name)
+		}
 	}
 
 	// Recover the addend the compiler left in the instruction stream, for the

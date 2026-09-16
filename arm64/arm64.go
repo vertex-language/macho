@@ -305,7 +305,7 @@ func (b *Backend) scanReloc(img *image.Image, atom *image.Atom, r image.Reloc, r
 
 	// A difference between two addresses in this image is a link-time
 	// constant. It does not slide, so it is neither a rebase nor a bind.
-	if r.Sub != nil {
+	if r.HasSub() {
 		return nil
 	}
 
@@ -363,7 +363,7 @@ func (b *Backend) Apply(s *backend.Site, r image.Reloc) error {
 		// into the same image. Writing it as a pointer puts eight bytes
 		// where there are four.
 		if r.Length == macho.RelocLong {
-			if r.Sub != nil {
+			if r.HasSub() {
 				if d := int64(value); d < -1<<31 || d >= 1<<31 {
 					return b.rangeErr(s, r, d, 32, 0, pc)
 				}
@@ -498,7 +498,7 @@ func (b *Backend) value(s *backend.Site, r image.Reloc, kind backend.Kind) (uint
 	// site Scan registered and this resolved would be written twice with
 	// different answers, and one Scan skipped and this resolved would
 	// ask an unbound symbol for its address.
-	if kind.IsPointer() && r.Sub == nil && r.Sym != nil && !r.Sym.Defined() {
+	if kind.IsPointer() && !r.HasSub() && r.Sym != nil && !r.Sym.Defined() {
 		return uint64(r.Addend), nil
 	}
 
@@ -506,11 +506,12 @@ func (b *Backend) value(s *backend.Site, r image.Reloc, kind backend.Kind) (uint
 	if err != nil {
 		return 0, err
 	}
-	if r.Sub != nil {
-		if !r.Sub.Bound {
-			return 0, fmt.Errorf("arm64: subtrahend %s is unbound", r.Sub.Name)
-		}
-		v -= r.Sub.Value
+	sub, has, err := r.Subtrahend()
+	if err != nil {
+		return 0, err
+	}
+	if has {
+		v -= sub
 	}
 	return v, nil
 }

@@ -207,8 +207,14 @@ type Reloc struct {
 	Sym  *Sym
 	Atom *Atom
 
-	// Sub is the subtrahend of a difference relocation.
-	Sub *Sym
+	// Sub is the subtrahend of a difference relocation, and SubAtom is
+	// the same thing for a subtrahend with internal linkage: a local
+	// symbol is a reference within its own object rather than a name
+	// for resolution to find, exactly as it is on the other side of the
+	// difference. SubAddend is its offset into that atom.
+	Sub       *Sym
+	SubAtom   *Atom
+	SubAddend int64
 
 	// Addend is recovered from the instruction stream or from a preceding
 	// ARM64_RELOC_ADDEND entry, because Mach-O relocations carry no addend
@@ -217,6 +223,25 @@ type Reloc struct {
 	// recovered and stored.
 	Addend int64
 }
+
+// Subtrahend is the address a difference relocation subtracts, and
+// false where there is none.
+func (r Reloc) Subtrahend() (uint64, bool, error) {
+	switch {
+	case r.SubAtom != nil:
+		a, err := r.SubAtom.Addr()
+		return a + uint64(r.SubAddend), true, err
+	case r.Sub != nil:
+		if !r.Sub.Bound {
+			return 0, true, fmt.Errorf("%w: %s is unbound", ErrNoSize, r.Sub.Name)
+		}
+		return r.Sub.Value, true, nil
+	}
+	return 0, false, nil
+}
+
+// HasSub reports whether the relocation is a difference.
+func (r Reloc) HasSub() bool { return r.Sub != nil || r.SubAtom != nil }
 
 // Target returns the address the relocation refers to.
 func (r Reloc) Target() (uint64, error) {

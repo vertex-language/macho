@@ -492,3 +492,93 @@ int f(K *k) { return [k one] + [k two]; }
 		t.Errorf("__objc_selrefs is %d bytes, want 16 — two selectors, two entries", size)
 	}
 }
+
+// TestLocalSubtrahendResolvesInItsObject builds the shape a relative
+// pointer has when the field it sits in belongs to a symbol with
+// internal linkage: a four-byte `to - from` where `from` is a local.
+//
+// The subtrahend used to be interned into the global symbol table
+// whatever its linkage, which made the link fail on a symbol defined
+// right there in the object. The other side of the difference had
+// always been resolved within the object; this is the same rule applied
+// to both halves. Every private descriptor is this shape -- the record
+// beside a private async function is one -- so it is the ordinary case
+// rather than a corner.
+func TestLocalSubtrahendResolvesInItsObject(t *testing.T) {
+	target, err := macho.ParseTarget("arm64-apple-macos14.0")
+	if err != nil {
+		t.Fatalf("ParseTarget: %v", err)
+	}
+	l, err := link.New(target)
+	if err != nil {
+		t.Fatalf("link.New: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.AddObject("t.o", buildLocalDeltaObject(t, target)); err != nil {
+		t.Fatalf("AddObject: %v", err)
+	}
+	if err := l.AddStub("libSystem", []byte(fakeLibSystem)); err != nil {
+		t.Fatalf("AddStub: %v", err)
+	}
+	l.Options().Output = link.OutputExecute
+	l.SetEntry("_main")
+
+	img, err := l.Link()
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if _, err := img.Bytes(); err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+}
+
+// buildLocalDeltaObject is an object holding a local four-byte field
+// whose value is the distance from itself to _main.
+func buildLocalDeltaObject(t *testing.T, target macho.Target) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := obj.NewWriter(&buf, obj.Options{
+		Target: target,
+		Flags:  macho.MH_SUBSECTIONS_VIA_SYMBOLS,
+		Build:  target.Build(),
+	})
+	text := w.Section(obj.SectionHeader{
+		Segment: macho.SEG_TEXT,
+		Name:    macho.SECT_TEXT,
+		Type:    macho.S_REGULAR,
+		Attrs:   macho.S_ATTR_PURE_INSTRUCTIONS,
+		Align:   4,
+	})
+	// mov w0, #0 ; ret
+	text.Write([]byte{0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6})
+	main := w.Symbol(obj.SymbolDef{
+		Name: "_main", Type: macho.N_SECT, Ext: true, Section: text,
+	})
+
+	konst := w.Section(obj.SectionHeader{
+		Segment: macho.SEG_TEXT,
+		Name:    "__const",
+		Type:    macho.S_REGULAR,
+		Align:   8,
+	})
+	konst.Write(make([]byte, 4))
+	// The record's own symbol is local: nothing outside this object
+	// names it.
+	record := w.Symbol(obj.SymbolDef{
+		Name: "l_record", Type: macho.N_SECT, Section: konst,
+	})
+	w.RelocPair(konst, obj.RelocSpec{
+		Address: 0, Sym: record,
+		Type:   uint8(macho.ARM64_RELOC_SUBTRACTOR),
+		Length: macho.RelocLong,
+	}, obj.RelocSpec{
+		Address: 0, Sym: main,
+		Type:   uint8(macho.ARM64_RELOC_UNSIGNED),
+		Length: macho.RelocLong,
+	})
+	if err := w.Close(); err != nil {
+		t.Fatalf("obj.Writer.Close: %v", err)
+	}
+	return buf.Bytes()
+}
